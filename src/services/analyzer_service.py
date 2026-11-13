@@ -101,6 +101,7 @@ def analyze_stocks(
 def perform_market_review(
     config: Config = None,
     notifier: Optional[NotificationService] = None,
+    send_notification: bool = True,
 ) -> Optional[str]:
     """
     执行大盘复盘
@@ -108,6 +109,7 @@ def perform_market_review(
     Args:
         config: 配置对象（可选，默认使用单例）
         notifier: 通知服务（可选）
+        send_notification: 是否推送复盘通知（默认推送，保持原行为）
 
     Returns:
         复盘报告内容
@@ -131,5 +133,6 @@ def perform_market_review(
         analyzer=pipeline.analyzer,
         search_service=pipeline.search_service,
         config=config,
+        send_notification=send_notification,
         trigger_source="service",
     )

@@ -59,6 +59,7 @@ This is the entry point for project documentation. The README covers the project
 | [Image Extraction Prompt](image-extract-prompt.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | Prompt and boundaries for extracting stock information from images |
 | [OpenClaw Skill Integration](openclaw-skill-integration.md) <sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub> (Chinese-only) | OpenClaw / Skill external integration notes |
 | [Grok Bot Integration](grok-bot-integration.md) <sub><sub>![P0 Badge](https://img.shields.io/badge/P0-green?style=flat)</sub></sub> (Chinese-only) | 2026-08-11 Grok Bot (AI teammate) vs LiteLLM `xai/` provider; HTTP / Skill / DecisionSignal consumption |
+| [ChatGPT dot / External Agent CLI](codex-dot-integration.md) <sub><sub>![P0 Badge](https://img.shields.io/badge/P0-green?style=flat)</sub></sub> (Chinese-only) | `python -m src.agent_cli` JSON CLI for analysis, market review, portfolio ledger and risk; dot persistent-computer setup, schedules, and confirm-before-record rules |
 
 ## Deployment And Packaging
 
