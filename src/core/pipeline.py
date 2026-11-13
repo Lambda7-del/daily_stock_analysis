@@ -223,6 +223,24 @@ def _symbol_scope_lookup_values(code: str, market: str) -> List[str]:
     return values
 
 
+def resolve_agent_pipeline_reason(config: Any, analysis_skills: Optional[List[str]] = None) -> Optional[str]:
+    """Return why single-stock analysis would take the Agent pipeline, or None.
+
+    Uses config.agent_mode (explicit opt-in) instead of config.is_agent_available()
+    so that users who only configured an API Key for the traditional analysis path
+    are not silently switched to Agent mode (which is slower and more expensive).
+    """
+    if getattr(config, 'agent_mode', False):
+        return "agent_mode"
+    if analysis_skills:
+        return f"request skills: {analysis_skills}"
+    # Specific configured skills (e.g., scheduled task with strategy) also imply Agent mode.
+    configured_skills = getattr(config, 'agent_skills', [])
+    if configured_skills and configured_skills != ['all']:
+        return f"configured skills: {configured_skills}"
+    return None
+
+
 class StockAnalysisPipeline:
     """
     股票分析主流程调度器
@@ -553,22 +571,10 @@ class StockAnalysisPipeline:
                 except Exception as e:
                     logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
 
-            # If agent mode is explicitly enabled, or specific agent skills are configured, use the Agent analysis pipeline.
-            # NOTE: use config.agent_mode (explicit opt-in) instead of
-            # config.is_agent_available() so that users who only configured an
-            # API Key for the traditional analysis path are not silently
-            # switched to Agent mode (which is slower and more expensive).
-            use_agent = getattr(self.config, 'agent_mode', False)
-            if not use_agent:
-                if self.analysis_skills:
-                    use_agent = True
-                    logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to request skills: {self.analysis_skills}")
-            if not use_agent:
-                # Auto-enable agent mode when specific skills are configured (e.g., scheduled task with strategy)
-                configured_skills = getattr(self.config, 'agent_skills', [])
-                if configured_skills and configured_skills != ['all']:
-                    use_agent = True
-                    logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to configured skills: {configured_skills}")
+            use_agent_reason = resolve_agent_pipeline_reason(self.config, self.analysis_skills)
+            use_agent = use_agent_reason is not None
+            if use_agent and use_agent_reason != "agent_mode":
+                logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to {use_agent_reason}")
 
             self._emit_progress(32, f"{stock_name}：正在聚合基本面与趋势数据")
 

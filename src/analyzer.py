@@ -59,6 +59,7 @@ from src.llm.backend_registry import (
     resolve_generation_fallback_backend_id,
 )
 from src.llm.backend_factory import create_generation_backend
+from src.llm.external_agent_backend import get_generation_backend_override
 from src.llm.generation_backend import (
     GenerationBackend,
     GenerationError,
@@ -1737,6 +1738,8 @@ _GENERATION_ERROR_DETAIL_KEYS = (
     "stdout_preview",
     "stderr_preview",
     "stderr_tail_preview",
+    "message",
+    "response_path",
 )
 
 
@@ -1759,7 +1762,10 @@ def _generation_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
     }
     for key in _GENERATION_ERROR_DETAIL_KEYS:
         if key in details:
-            payload[key] = details[key]
+            value = details[key]
+            # Preview fields are already redacted by the backend; free-form
+            # messages may come from any backend and are redacted here.
+            payload[key] = redact_diagnostic_text(str(value)) if key == "message" else value
     return payload
 
 
@@ -2942,6 +2948,11 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
     def is_available(self) -> bool:
         """Check whether the configured generation backend is available."""
+        if get_generation_backend_override() is not None:
+            # External-agent hand-off: the configured model is never used, so
+            # optional LLM steps (e.g. market context) take their no-model path.
+            # Stock analysis itself bypasses this check in analyze().
+            return False
         backend_error = self.get_generation_backend_config_error()
         if backend_error is not None:
             return self._can_use_generation_fallback(backend_error)
@@ -2974,6 +2985,8 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
 
     def get_generation_backend_config_error(self) -> Optional[GenerationError]:
         """Return a structured backend config error, if the backend cannot run."""
+        if get_generation_backend_override() is not None:
+            return None
         try:
             backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             config = self._get_runtime_config()
@@ -3565,6 +3578,22 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
         return_generation_result: bool = False,
     ) -> Union[Tuple[str, str, Dict[str, Any]], GenerationResult]:
         """Compatibility wrapper around the configured generation backend."""
+        override_backend = get_generation_backend_override()
+        if override_backend is not None:
+            # No backend fallback: an external-agent hand-off must never turn
+            # into a hidden call to the configured model.
+            result = override_backend.generate(
+                prompt,
+                generation_config,
+                system_prompt=system_prompt,
+                stream=stream,
+                stream_progress_callback=stream_progress_callback,
+                response_validator=response_validator,
+                audit_context=audit_context,
+            )
+            if return_generation_result:
+                return result
+            return result.text, result.model, result.usage
         preflight_error = self.get_generation_backend_config_error()
         if preflight_error is not None and not self._can_use_generation_fallback(preflight_error):
             raise preflight_error
@@ -4117,6 +4146,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 # 最后从映射表获取
                 name = STOCK_NAME_MAP.get(code, f'股票{code}')
 
+        handoff_active = get_generation_backend_override() is not None
         backend_error = self.get_generation_backend_config_error()
         if backend_error is not None and not self._can_use_generation_fallback(backend_error):
             details = backend_error.details or {}
@@ -4168,7 +4198,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             )
 
         # 如果模型不可用，返回默认结果
-        if not self.is_available():
+        if not handoff_active and not self.is_available():
             return AnalysisResult(
                 code=code,
                 name=name,
@@ -4232,7 +4262,11 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
             config = self._get_runtime_config()
             backend_id, _fallback_backend_id = self._resolve_generation_backend_config()
             model_name = config.litellm_model or "unknown"
-            if backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
+            override_backend = get_generation_backend_override()
+            if override_backend is not None:
+                model_name = override_backend.backend_id
+                legacy_audit_context["transport"] = override_backend.backend_id
+            elif backend_id in LOCAL_CLI_GENERATION_BACKEND_IDS:
                 model_name = backend_id
                 legacy_audit_context["transport"] = backend_id
             logger.info(f"========== AI 分析 {name}({code}) ==========")

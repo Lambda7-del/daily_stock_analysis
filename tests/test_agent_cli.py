@@ -247,6 +247,12 @@ def _fake_result(code: str, *, success: bool = True) -> SimpleNamespace:
     )
 
 
+def agent_cli_override():
+    from src.llm.external_agent_backend import get_generation_backend_override
+
+    return get_generation_backend_override()
+
+
 class AgentCliAnalysisTest(unittest.TestCase):
     def test_analyze_summarizes_results_and_saves_report(self) -> None:
         notifier = MagicMock()
@@ -284,6 +290,76 @@ class AgentCliAnalysisTest(unittest.TestCase):
         self.assertIn("error sending request", failed["error_details"]["stderr_tail_preview"])
         self.assertEqual(payload["error"]["details"]["missing"], [])
         notifier_cls.assert_not_called()
+
+    def test_context_returns_handoff_paths_from_capture_backend(self) -> None:
+        from src.llm.external_agent_backend import PromptCaptureBackend, get_generation_backend_override
+
+        def _fake_analyze(codes, **_kwargs):
+            backend = get_generation_backend_override()
+            self.assertIsInstance(backend, PromptCaptureBackend)
+            with self.assertRaises(Exception):
+                backend.generate("user prompt", {}, system_prompt="system prompt", audit_context={
+                    "analysis_mode": "stock_analysis",
+                    "dynamic_markers": [{"marker_name": "stock_code", "text": "600519"}],
+                })
+            return [_fake_result("600519", success=False), _fake_result("AAPL", success=False)]
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("src.services.analyzer_service.analyze_stocks", side_effect=_fake_analyze), \
+                patch("src.config.get_config", return_value=SimpleNamespace(agent_mode=False, agent_skills=[])):
+            code, payload = _run(["context", "--stocks", "600519,AAPL,TSLA", "--handoff-dir", tmp])
+            prompt_text = Path(payload["data"]["stocks"][0]["prompt_path"]).read_text(encoding="utf-8")
+
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        data = payload["data"]
+        self.assertEqual(prompt_text, "user prompt")
+        self.assertEqual([s["code"] for s in data["stocks"]], ["600519"])
+        self.assertTrue(data["stocks"][0]["response_path"].endswith("600519.response.json"))
+        self.assertEqual([f["code"] for f in data["failed"]], ["AAPL"])
+        self.assertEqual(data["missing"], ["TSLA"])
+        self.assertEqual(data["next_command"],
+                         f"python -m src.agent_cli analyze --stocks 600519 --responses {tmp}")
+        self.assertIsNone(agent_cli_override())
+
+    def test_context_rejects_agent_pipeline(self) -> None:
+        with patch("src.services.analyzer_service.analyze_stocks") as analyze, \
+                patch("src.config.get_config", return_value=SimpleNamespace(agent_mode=True)):
+            code, payload = _run(["context", "--stocks", "600519"])
+
+        self.assertEqual(code, agent_cli.EXIT_USAGE_ERROR)
+        self.assertEqual(payload["error"]["type"], "agent_pipeline_unsupported")
+        analyze.assert_not_called()
+
+    def test_analyze_responses_replays_through_override(self) -> None:
+        from src.llm.external_agent_backend import ResponseReplayBackend, get_generation_backend_override
+
+        seen = {}
+
+        def _fake_analyze(codes, **_kwargs):
+            seen["backend"] = get_generation_backend_override()
+            return [_fake_result("600519")]
+
+        notifier = MagicMock()
+        notifier.save_report_to_file.return_value = "/tmp/agent_report.md"
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("src.services.analyzer_service.analyze_stocks", side_effect=_fake_analyze), \
+                patch("src.config.get_config", return_value=SimpleNamespace(agent_mode=False, agent_skills=[])), \
+                patch("src.notification.NotificationService", return_value=notifier):
+            code, payload = _run(["analyze", "--stocks", "600519", "--responses", tmp, "--model-label", "dot"])
+
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        self.assertIsInstance(seen["backend"], ResponseReplayBackend)
+        self.assertEqual(seen["backend"].model_label, "dot")
+        self.assertIsNone(agent_cli_override())
+
+    def test_analyze_responses_requires_existing_dir(self) -> None:
+        with patch("src.services.analyzer_service.analyze_stocks") as analyze, \
+                patch("src.config.get_config", return_value=SimpleNamespace()):
+            code, payload = _run(["analyze", "--stocks", "600519", "--responses", "/nonexistent/handoff"])
+
+        self.assertEqual(code, agent_cli.EXIT_USAGE_ERROR)
+        self.assertEqual(payload["error"]["type"], "validation_error")
+        analyze.assert_not_called()
 
     def test_generation_error_details_walks_exception_chain_and_whitelists_keys(self) -> None:
         from src.analyzer import _generation_error_details

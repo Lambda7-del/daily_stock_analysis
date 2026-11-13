@@ -7,6 +7,8 @@ Agent CLI - 面向外部 Agent 的 JSON 命令行入口
 供 ChatGPT dot、Codex 等外部 Agent 在终端中调用 DSA 现有能力：
 
     python -m src.agent_cli analyze --stocks 600519,AAPL
+    python -m src.agent_cli context --stocks 600519          # 只取数，提示词交给外部 Agent
+    python -m src.agent_cli analyze --stocks 600519 --responses <handoff_dir>
     python -m src.agent_cli market-review
     python -m src.agent_cli portfolio snapshot
     python -m src.agent_cli portfolio trade-add ... --trade-uid X --confirmed
@@ -33,6 +35,7 @@ import sys
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, TextIO
 
 logger = logging.getLogger(__name__)
@@ -143,18 +146,99 @@ def _summarize_analysis_result(result: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
+def _require_codes(args: argparse.Namespace) -> List[str]:
+    codes = _split_codes(args.stocks)
+    if not codes:
+        raise AgentCliError("validation_error", "--stocks 不能为空")
+    return codes
+
+
+def _reject_agent_pipeline(config: Any) -> None:
+    from src.core.pipeline import resolve_agent_pipeline_reason
+
+    reason = resolve_agent_pipeline_reason(config)
+    if reason is not None:
+        raise AgentCliError(
+            "agent_pipeline_unsupported",
+            f"当前配置会让个股分析走 Agent 链路（{reason}），外部 Agent 交接不支持该链路；"
+            "请关闭 AGENT_MODE 并清空 AGENT_SKILLS 后重试",
+        )
+
+
+def _default_handoff_dir() -> Path:
+    reports_dir = Path(__file__).resolve().parent.parent / "reports"
+    return reports_dir / "agent_handoff" / datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _cmd_context(args: argparse.Namespace) -> Dict[str, Any]:
+    from src.config import get_config
+    from src.llm.external_agent_backend import PromptCaptureBackend, generation_backend_override
+    from src.services.analyzer_service import analyze_stocks
+
+    codes = _require_codes(args)
+    config = get_config()
+    _reject_agent_pipeline(config)
+    handoff_dir = Path(args.handoff_dir).expanduser() if args.handoff_dir else _default_handoff_dir()
+
+    backend = PromptCaptureBackend(handoff_dir)
+    with generation_backend_override(backend):
+        results = analyze_stocks(codes, config=config, full_report=args.full)
+
+    captured = {code.upper(): (code, paths) for code, paths in backend.captured.items()}
+    stocks: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    for result in results:
+        entry = captured.pop(str(getattr(result, "code", "")).upper(), None)
+        if entry is None:
+            failed.append(_summarize_analysis_result(result))
+        else:
+            stocks.append({"code": entry[0], "name": getattr(result, "name", None), **entry[1]})
+    stocks.extend({"code": code, "name": None, **paths} for code, paths in captured.values())
+    returned_codes = {str(item["code"]).upper() for item in stocks + failed}
+    missing = [code for code in codes if code.upper() not in returned_codes]
+
+    if not stocks:
+        raise AgentCliError(
+            "context_failed",
+            f"没有股票生成分析上下文: requested={codes}, missing={missing}",
+            exit_code=EXIT_RUNTIME_ERROR,
+            details={"failed": failed, "missing": missing},
+        )
+    stock_arg = ",".join(item["code"] for item in stocks)
+    return {
+        "requested": codes,
+        "handoff_dir": str(handoff_dir),
+        "stocks": stocks,
+        "failed": failed,
+        "missing": missing,
+        "instructions": (
+            "对每只股票：以 system_prompt_path 为系统指令、prompt_path 为输入完成分析，"
+            "把一个符合其中输出格式要求的 JSON 对象写入 response_path，然后执行 next_command 入库。"
+        ),
+        "next_command": f"python -m src.agent_cli analyze --stocks {stock_arg} --responses {handoff_dir}",
+    }
+
+
 def _cmd_analyze(args: argparse.Namespace) -> Dict[str, Any]:
     from src.config import get_config
     from src.enums import ReportType
     from src.notification import NotificationService
     from src.services.analyzer_service import analyze_stocks
 
-    codes = _split_codes(args.stocks)
-    if not codes:
-        raise AgentCliError("validation_error", "--stocks 不能为空")
-
+    codes = _require_codes(args)
     config = get_config()
-    results = analyze_stocks(codes, config=config, full_report=args.full)
+    if args.responses:
+        from src.llm.external_agent_backend import ResponseReplayBackend, generation_backend_override
+
+        responses_dir = Path(args.responses).expanduser()
+        if not responses_dir.is_dir():
+            raise AgentCliError("validation_error", f"--responses 目录不存在: {responses_dir}")
+        _reject_agent_pipeline(config)
+        backend = ResponseReplayBackend(responses_dir, model_label=args.model_label)
+        with generation_backend_override(backend):
+            results = analyze_stocks(codes, config=config, full_report=args.full)
+    else:
+        results = analyze_stocks(codes, config=config, full_report=args.full)
     items = [_summarize_analysis_result(r) for r in results]
     returned_codes = {str(getattr(r, "code", "")).upper() for r in results}
     missing = [code for code in codes if code.upper() not in returned_codes]
@@ -319,7 +403,23 @@ def build_parser() -> argparse.ArgumentParser:
     analyze = commands.add_parser("analyze", help="分析一只或多只股票并生成报告")
     analyze.add_argument("--stocks", required=True, help="逗号分隔的股票代码，如 600519,hk00700,AAPL")
     analyze.add_argument("--full", action="store_true", help="生成完整报告")
+    analyze.add_argument(
+        "--responses",
+        default=None,
+        help="context 交接目录；用其中外部 Agent 写好的 <code>.response.json 代替模型生成",
+    )
+    analyze.add_argument(
+        "--model-label",
+        default="external_agent",
+        help="配合 --responses，记录到报告与历史的 model_used",
+    )
     analyze.set_defaults(handler=_cmd_analyze, command_name="analyze")
+
+    context = commands.add_parser("context", help="只取数并生成分析提示词，交给外部 Agent 分析（不调用模型）")
+    context.add_argument("--stocks", required=True, help="逗号分隔的股票代码，如 600519,hk00700,AAPL")
+    context.add_argument("--full", action="store_true", help="按完整报告类型准备上下文")
+    context.add_argument("--handoff-dir", default=None, help="交接目录，默认 reports/agent_handoff/<时间戳>")
+    context.set_defaults(handler=_cmd_context, command_name="context")
 
     review = commands.add_parser("market-review", help="大盘复盘（不推送通知）")
     review.set_defaults(handler=_cmd_market_review, command_name="market-review")
