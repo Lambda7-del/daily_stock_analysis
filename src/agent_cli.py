@@ -57,6 +57,7 @@ _ANALYSIS_RESULT_FIELDS = (
     "change_pct",
     "analysis_summary",
     "model_used",
+    "error_details",
 )
 _DASHBOARD_FIELDS = ("core_conclusion", "battle_plan")
 
@@ -64,11 +65,18 @@ _DASHBOARD_FIELDS = ("core_conclusion", "battle_plan")
 class AgentCliError(Exception):
     """Structured CLI failure rendered as ``{"ok": false, "error": ...}``."""
 
-    def __init__(self, error_type: str, message: str, exit_code: int = EXIT_USAGE_ERROR) -> None:
+    def __init__(
+        self,
+        error_type: str,
+        message: str,
+        exit_code: int = EXIT_USAGE_ERROR,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.error_type = error_type
         self.message = message
         self.exit_code = exit_code
+        self.details = details
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -166,6 +174,7 @@ def _cmd_analyze(args: argparse.Namespace) -> Dict[str, Any]:
             f"没有股票分析成功: requested={codes}, missing={missing}, "
             f"errors={[i.get('error_message') for i in items]}",
             exit_code=EXIT_RUNTIME_ERROR,
+            details={"results": items, "missing": missing},
         )
     return {
         "requested": codes,
@@ -439,11 +448,10 @@ def run(
             error = _classify_exception(exc)
             if error.exit_code == EXIT_RUNTIME_ERROR:
                 logger.error("agent_cli %s failed: %s", command_name, error.message, exc_info=exc)
-            payload = {
-                "ok": False,
-                "command": command_name,
-                "error": {"type": error.error_type, "message": error.message},
-            }
+            error_payload: Dict[str, Any] = {"type": error.error_type, "message": error.message}
+            if error.details is not None:
+                error_payload["details"] = error.details
+            payload = {"ok": False, "command": command_name, "error": error_payload}
             exit_code = error.exit_code
     out.write(_dump(payload) + "\n")
     out.flush()

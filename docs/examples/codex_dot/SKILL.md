@@ -13,7 +13,8 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI，
 - 统一入口：`cd $DSA_HOME && $DSA_PY -m src.agent_cli <子命令>`。
 - stdout 只有一个 JSON 对象，日志在 stderr。只解析 stdout，不要把 stderr 当结果。
   - 成功：`{"ok": true, "command": "...", "data": {...}}`
-  - 失败：`{"ok": false, "command": "...", "error": {"type": "...", "message": "..."}}`
+  - 失败：`{"ok": false, "command": "...", "error": {"type": "...", "message": "...", "details": {...}}}`（`details` 可选）
+  - `analyze` 返回 `analysis_failed` 时，向用户汇报 `error.details.results[].error_details` 中的 `reason`、`returncode` 和 `stderr_tail_preview`，不要只转述 `message`。
 - 退出码：`0` 成功；`2` 参数、校验或确认类错误（不要原样重试，先修正参数或征求用户确认）；`1` 运行错误（可以稍后重试一次）。
 - `analyze` 单只股票可能需要数分钟，给命令留足超时；股票多时分批执行。
 

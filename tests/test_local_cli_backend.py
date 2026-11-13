@@ -1187,6 +1187,40 @@ raise SystemExit(2)
     assert exc_info.value.details["returncode"] == 2
 
 
+def test_non_zero_exit_network_failure_wins_over_banner_approval_text(tmp_path: Path) -> None:
+    backend = _backend(
+        tmp_path,
+        """
+import sys
+print('approval: never', file=sys.stderr)
+print('banner ' * 200, file=sys.stderr)
+print('ERROR: failed to refresh: Connection failed: error sending request', file=sys.stderr)
+print('OPENAI_API_KEY=sk-tail-secret-value', file=sys.stderr)
+raise SystemExit(1)
+""",
+    )
+
+    with pytest.raises(GenerationError) as exc_info:
+        backend.generate("prompt", {})
+
+    details = exc_info.value.details
+    assert exc_info.value.error_code is GenerationErrorCode.NON_ZERO_EXIT
+    assert details["reason"] == "network_unreachable"
+    assert "error sending request" not in details["stderr_preview"]
+    tail = details["stderr_tail_preview"]
+    assert tail.startswith("<truncated>...")
+    assert "error sending request" in tail
+    assert "sk-tail-secret-value" not in tail
+    assert "OPENAI_API_KEY=<redacted>" in tail
+
+
+def test_short_stderr_has_no_tail_preview() -> None:
+    previews = local_cli_backend_module._preview_diagnostics("", "short failure")
+
+    assert previews["stderr_preview"] == "short failure"
+    assert "stderr_tail_preview" not in previews
+
+
 def test_non_zero_exit_maps_cli_contract_unsupported(tmp_path: Path) -> None:
     preset = LocalCliPreset(
         "codex_cli",

@@ -240,6 +240,8 @@ def _fake_result(code: str, *, success: bool = True) -> SimpleNamespace:
         change_pct=1.77,
         analysis_summary="summary",
         model_used="codex_cli",
+        error_details=None if success else {"error_code": "non_zero_exit", "reason": "network_unreachable",
+                                            "stderr_tail_preview": "<truncated>...error sending request"},
         dashboard={"core_conclusion": {"one_sentence": "等待"}, "battle_plan": {"sniper_points": {}},
                    "intelligence": {"ignored": True}},
     )
@@ -276,7 +278,40 @@ class AgentCliAnalysisTest(unittest.TestCase):
 
         self.assertEqual(code, agent_cli.EXIT_RUNTIME_ERROR)
         self.assertEqual(payload["error"]["type"], "analysis_failed")
+        failed = payload["error"]["details"]["results"][0]
+        self.assertEqual(failed["error_message"], "llm failed")
+        self.assertEqual(failed["error_details"]["reason"], "network_unreachable")
+        self.assertIn("error sending request", failed["error_details"]["stderr_tail_preview"])
+        self.assertEqual(payload["error"]["details"]["missing"], [])
         notifier_cls.assert_not_called()
+
+    def test_generation_error_details_walks_exception_chain_and_whitelists_keys(self) -> None:
+        from src.analyzer import _generation_error_details
+        from src.llm.generation_backend import GenerationError, GenerationErrorCode
+
+        backend_error = GenerationError(
+            error_code=GenerationErrorCode.NON_ZERO_EXIT,
+            stage="execution",
+            retryable=False,
+            fallbackable=True,
+            backend="codex_cli",
+            details={"reason": "network_unreachable", "returncode": 1,
+                     "stderr_tail_preview": "tail", "argv": ["codex", "exec"]},
+        )
+        try:
+            try:
+                raise backend_error
+            except GenerationError as exc:
+                raise RuntimeError("wrapped") from exc
+        except RuntimeError as wrapped:
+            details = _generation_error_details(wrapped)
+
+        self.assertEqual(details["error_code"], "non_zero_exit")
+        self.assertEqual(details["backend"], "codex_cli")
+        self.assertEqual(details["reason"], "network_unreachable")
+        self.assertEqual(details["stderr_tail_preview"], "tail")
+        self.assertNotIn("argv", details)
+        self.assertIsNone(_generation_error_details(ValueError("plain")))
 
     def test_market_review_does_not_notify(self) -> None:
         with patch("src.services.analyzer_service.perform_market_review", return_value="# review") as review, \

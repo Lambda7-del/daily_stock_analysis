@@ -52,7 +52,9 @@ LOG_DIR=/home/<user>/dsa-data/logs
 - **使用 ChatGPT 订阅（Codex CLI）**：在该电脑上安装 Codex CLI，执行 `codex login --device-auth` 登录，然后设置 `GENERATION_BACKEND=codex_cli` 与 `GENERATION_FALLBACK_BACKEND=codex_cli`。单只股票的生成通常需要数分钟，可调大 `GENERATION_BACKEND_TIMEOUT_SECONDS`。细节与限制见 [LLM 配置指南](LLM_CONFIG_GUIDE.md)。
 - **使用 API Key**：按 [LLM 配置指南](LLM_CONFIG_GUIDE.md) 配置任一渠道。
 
-已知限制：本地 CLI backend 的子进程环境只透传最小 allowlist，`HTTP(S)_PROXY` 不在其中。如果该电脑需要通过环境变量代理才能访问 OpenAI，`codex_cli` 会以非零退出失败（诊断可能被归类为 `approval_required`）；海外云电脑通常不受影响。
+已知限制：本地 CLI backend 的子进程环境只透传最小 allowlist，`HTTP(S)_PROXY` 不在其中。如果该电脑需要通过环境变量代理才能访问 OpenAI，`codex_cli` 会以非零退出失败（`error_details.reason` 为 `network_unreachable`）；海外云电脑通常不受影响。
+
+排障：`analyze` 全部失败时返回 `analysis_failed`，逐只诊断在 `error.details.results[].error_details`，重点看 `reason`、`returncode` 和 `stderr_tail_preview`（CLI 输出的脱敏尾部，真实错误通常在这里，开头的 `stderr_preview` 多是会话横幅）。
 
 ### 3. 数据源
 

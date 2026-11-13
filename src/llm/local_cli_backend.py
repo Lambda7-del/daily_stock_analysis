@@ -50,6 +50,16 @@ MAX_GENERATION_BACKEND_MAX_CONCURRENCY = 16
 MAX_LOCAL_CLI_BACKEND_MAX_CONCURRENCY = 4
 
 _PREVIEW_LIMIT = 800
+_NETWORK_FAILURE_MARKERS = (
+    "error sending request",
+    "connection failed",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "could not resolve host",
+    "name or service not known",
+    "dns error",
+)
 _FINAL_MESSAGE_OMITTED_PREVIEW = "<final-message omitted from stdout preview>"
 _STDOUT_PREVIEW_OMITTED = "<stdout preview omitted because output-last-message was too large>"
 _PROCESS_POLL_INTERVAL_SECONDS = 0.05
@@ -2711,6 +2721,10 @@ class LocalCliGenerationBackend(GenerationBackend):
         ):
             code = GenerationErrorCode.UNKNOWN_BACKEND_ERROR
             reason = "cli_result_error"
+        elif any(marker in combined for marker in _NETWORK_FAILURE_MARKERS):
+            # Checked before login/approval: CLI session banners echo settings
+            # such as "approval: never", which would otherwise mask transport failures.
+            reason = "network_unreachable"
         elif "login" in combined or "authentication" in combined or "not authenticated" in combined:
             code = GenerationErrorCode.LOGIN_REQUIRED
             reason = "login_required"
@@ -2895,17 +2909,26 @@ def _executable_summary(path: str) -> Dict[str, str]:
     }
 
 
-def _preview_diagnostics(stdout: str, stderr: str) -> Dict[str, str]:
-    return {
+def _preview_diagnostics(stdout: str, stderr: str, *, include_tail: bool = True) -> Dict[str, str]:
+    previews = {
         "stdout_preview": redact_diagnostic_text(stdout or ""),
         "stderr_preview": redact_diagnostic_text(stderr or ""),
     }
+    if include_tail:
+        # CLIs print session banners first and the actual failure last, so a
+        # head-only preview hides the error. Redact the full text before slicing
+        # so the tail never starts inside an unredacted value.
+        full_stderr = redact_diagnostic_text(stderr or "", limit=MAX_LOCAL_CLI_OUTPUT_BYTES)
+        if len(full_stderr) > _PREVIEW_LIMIT:
+            previews["stderr_tail_preview"] = "<truncated>..." + full_stderr[-_PREVIEW_LIMIT:]
+    return previews
 
 
 def _preview_diagnostics_from_files(stdout_path: Path, stderr_path: Path) -> Dict[str, str]:
     return _preview_diagnostics(
         _read_text_file(stdout_path, limit_bytes=_PREVIEW_LIMIT * 4),
         _read_text_file(stderr_path, limit_bytes=_PREVIEW_LIMIT * 4),
+        include_tail=False,
     )
 
 

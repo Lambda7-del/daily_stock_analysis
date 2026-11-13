@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 - [新功能] 新增面向外部 Agent（如 ChatGPT dot）的 JSON 命令行入口 `python -m src.agent_cli`，覆盖个股分析、大盘复盘、持仓账本、持仓风险与决策信号查询；持仓写操作需显式确认，成交按 `trade_uid` 去重，附 dot 部署文档与 Skill 示例。
+- [改进] 本地 CLI 生成后端失败时保留脱敏后的 stderr 尾部（`stderr_tail_preview`），网络连接失败归类为 `network_unreachable` 而非被会话横幅误判为 `approval_required`；`agent_cli analyze` 全部失败时在 `error.details.results[].error_details` 返回后端诊断。
 - [修复] 每日 Actions 未设置实时行情顺序时保留空值，使仅配置 TickPlus Key 的任务正确启用自动首选及批量实时预取；保留显式顺序和无 Key 免费源回退。
 
 - [修复] TickPlus 正确区分裸 000001 等股票与显式同码指数；补齐行情指标、按接口冷却与分组批量缓存，ETF 轮动使用独立前复权实例，并统一首选推荐入口。

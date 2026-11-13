@@ -1728,6 +1728,41 @@ def get_stock_name_multi_source(
     return f'股票{stock_code}'
 
 
+_GENERATION_ERROR_DETAIL_KEYS = (
+    "reason",
+    "returncode",
+    "preset_id",
+    "timeout_seconds",
+    "output_source",
+    "stdout_preview",
+    "stderr_preview",
+    "stderr_tail_preview",
+)
+
+
+def _generation_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
+    """Return redacted backend diagnostics for a failed generation, if any."""
+    error: Optional[BaseException] = exc
+    seen = 0
+    while error is not None and not isinstance(error, GenerationError) and seen < 5:
+        error = error.__cause__ or error.__context__
+        seen += 1
+    if not isinstance(error, GenerationError):
+        return None
+    details = error.details or {}
+    payload: Dict[str, Any] = {
+        "error_code": error.error_code.value,
+        "stage": error.stage,
+        "backend": error.backend,
+        "retryable": error.retryable,
+        "fallbackable": error.fallbackable,
+    }
+    for key in _GENERATION_ERROR_DETAIL_KEYS:
+        if key in details:
+            payload[key] = details[key]
+    return payload
+
+
 @dataclass
 class AnalysisResult:
     """
@@ -1811,6 +1846,8 @@ class AnalysisResult:
     # ========== 基本面上下文（仅运行时，用于通知拼装；不持久化到 to_dict）==========
     fundamental_context: Optional[Dict[str, Any]] = None
     market_structure_context: Optional[Dict[str, Any]] = None
+    # 生成后端失败诊断（仅运行时，已脱敏；不持久化到 to_dict）
+    error_details: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
@@ -4346,6 +4383,7 @@ Output strictly in the following JSON format. This is a complete Decision Dashbo
                 ),
                 success=False,
                 error_message=safe_error,
+                error_details=_generation_error_details(e),
                 model_used=None,
                 report_language=report_language,
             )
