@@ -2427,6 +2427,61 @@ class AkshareFetcher(BaseFetcher):
             logger.warning(f"[Akshare] 获取涨停池失败: {e}")
             return None
 
+    def get_sge_spot_history(self, symbol: str = "Au99.99") -> pd.DataFrame:
+        """
+        获取上海黄金交易所现货日线（元/克）
+
+        数据来源：ak.spot_hist_sge()，返回按日期升序的 date/open/high/low/close。
+        失败或无数据时抛出 DataFetchError，由调用方决定降级方式。
+        """
+        import akshare as ak
+
+        self._enforce_rate_limit()
+        df = _akshare_call_with_timeout(
+            ak.spot_hist_sge,
+            symbol=symbol,
+            timeout=self._history_call_timeout,
+            call_name="ak.spot_hist_sge",
+        )
+        columns = ["date", "open", "high", "low", "close"]
+        if df is None or df.empty:
+            raise DataFetchError(f"ak.spot_hist_sge 未返回 {symbol} 数据")
+        missing = [col for col in columns if col not in df.columns]
+        if missing:
+            raise DataFetchError(f"ak.spot_hist_sge 返回缺少列 {missing}: {list(df.columns)}")
+        df = df[columns].copy()
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+
+    def get_sge_spot_quote(self, symbol: str = "Au99.99") -> Dict[str, Any]:
+        """
+        获取上海黄金交易所现货最新报价（元/克）
+
+        数据来源：ak.spot_quotations_sge()，该接口返回当日分钟级报价，取最后一条。
+        失败或无数据时抛出 DataFetchError，由调用方决定降级方式。
+        """
+        import akshare as ak
+
+        self._enforce_rate_limit()
+        df = _akshare_call_with_timeout(
+            ak.spot_quotations_sge,
+            symbol=symbol,
+            timeout=self._history_call_timeout,
+            call_name="ak.spot_quotations_sge",
+        )
+        if df is None or df.empty or "现价" not in df.columns:
+            raise DataFetchError(f"ak.spot_quotations_sge 未返回 {symbol} 有效报价")
+        valid = df.dropna(subset=["现价"])
+        if valid.empty:
+            raise DataFetchError(f"ak.spot_quotations_sge 返回的 {symbol} 报价均为空")
+        last = valid.iloc[-1]
+        return {
+            "symbol": str(last.get("品种", symbol)),
+            "price": float(last["现价"]),
+            "time": str(last.get("时间", "")),
+            "updated_at": str(last.get("更新时间", "")),
+        }
+
     @staticmethod
     def _normalize_limit_time_value(value: Any) -> str:
         """Normalize AkShare HHMMSS-like seal time values to zero-padded HHMMSS."""

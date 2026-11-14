@@ -10,6 +10,7 @@ Agent CLI - 面向外部 Agent 的 JSON 命令行入口
     python -m src.agent_cli context --stocks 600519          # 只取数，提示词交给外部 Agent
     python -m src.agent_cli analyze --stocks 600519 --responses <handoff_dir>
     python -m src.agent_cli market-review
+    python -m src.agent_cli gold --days 30                   # 上金所 Au99.99 行情（元/克）
     python -m src.agent_cli portfolio snapshot
     python -m src.agent_cli portfolio trade-add ... --trade-uid X --confirmed
     python -m src.agent_cli signal latest 600519
@@ -63,6 +64,7 @@ _ANALYSIS_RESULT_FIELDS = (
     "error_details",
 )
 _DASHBOARD_FIELDS = ("core_conclusion", "battle_plan")
+_GOLD_MAX_DAYS = 250
 
 
 class AgentCliError(Exception):
@@ -115,6 +117,16 @@ def _parse_date(raw: str) -> date:
         return date.fromisoformat(raw)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"invalid date {raw!r}, expected YYYY-MM-DD") from exc
+
+
+def _parse_gold_days(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid days {raw!r}, expected integer") from exc
+    if not 1 <= value <= _GOLD_MAX_DAYS:
+        raise argparse.ArgumentTypeError(f"days must be between 1 and {_GOLD_MAX_DAYS}, got {value}")
+    return value
 
 
 def _split_codes(raw: str) -> List[str]:
@@ -278,6 +290,15 @@ def _cmd_market_review(args: argparse.Namespace) -> Dict[str, Any]:
     return {"report": report}
 
 
+def _cmd_gold(args: argparse.Namespace) -> Dict[str, Any]:
+    from src.services.gold_quote_service import GoldQuoteUnavailableError, get_gold_quote
+
+    try:
+        return get_gold_quote(days=args.days, realtime=not args.no_realtime)
+    except GoldQuoteUnavailableError as exc:
+        raise AgentCliError("data_unavailable", str(exc), exit_code=EXIT_RUNTIME_ERROR) from exc
+
+
 def _cmd_portfolio_accounts(args: argparse.Namespace) -> Dict[str, Any]:
     from src.services.portfolio_service import PortfolioService
 
@@ -423,6 +444,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     review = commands.add_parser("market-review", help="大盘复盘（不推送通知）")
     review.set_defaults(handler=_cmd_market_review, command_name="market-review")
+
+    gold = commands.add_parser("gold", help="上海黄金交易所 Au99.99 实时价与日线（元/克），不做分析")
+    gold.add_argument(
+        "--days",
+        type=_parse_gold_days,
+        default=30,
+        help=f"返回最近 N 条日线，1-{_GOLD_MAX_DAYS}，默认 30",
+    )
+    gold.add_argument("--no-realtime", action="store_true", help="不拉取实时价，仅返回日线")
+    gold.set_defaults(handler=_cmd_gold, command_name="gold")
 
     portfolio = commands.add_parser("portfolio", help="持仓账本与风险")
     portfolio_cmds = portfolio.add_subparsers(dest="portfolio_command", required=True)

@@ -1,6 +1,6 @@
 ---
 name: daily-stock-analysis-cli
-description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：由 DSA 取数并组装分析上下文，你自己完成个股分析后交回 DSA 入库，再做持仓快照与风险检查，并在用户确认成交后记账。当用户要求分析股票、做每日复盘、查看或调整持仓记录时使用。
+description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：由 DSA 取数并组装分析上下文，你自己完成个股分析后交回 DSA 入库，再做持仓快照与风险检查，并在用户确认成交后记账。也可查询上金所 Au99.99 黄金行情（元/克）。当用户要求分析股票、做每日复盘、查看或调整持仓记录、查询国内金价时使用。
 ---
 
 # daily_stock_analysis Agent CLI
@@ -27,6 +27,7 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 | 取数并生成分析提示词（不调用模型） | `context --stocks 600519,hk00700,AAPL [--handoff-dir DIR]` |
 | 提交你写好的分析并入库、生成报告 | `analyze --stocks <同上> --responses <handoff_dir> [--model-label dot]` |
 | 大盘复盘数据（不推送通知） | `market-review` |
+| 上金所 Au99.99 黄金行情（元/克，只取数不分析） | `gold [--days 30] [--no-realtime]` |
 | 列出持仓账户 | `portfolio accounts` |
 | 持仓快照与盈亏 | `portfolio snapshot [--account-id N] [--no-realtime]` |
 | 持仓风险报告 | `portfolio risk [--account-id N] [--no-realtime]` |
@@ -47,6 +48,11 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 5. 某只股票失败时看 `error_details`：`invalid_json` / `schema_validation_failed` 表示 JSON 不合格，按 `message` 修正文件后只重跑该股票；`response_file_missing` 表示文件没写到 `response_path`。
 
 `analyze` 的 `data.results[]` 里，结论读 `operation_advice` / `action`（八态 `buy|add|hold|reduce|sell|watch|avoid|alert`）、`sentiment_score`、`trend_prediction`，点位读 `battle_plan`。
+
+## 黄金行情
+
+- 用户问金价（元/克）时调用 `gold`，基于 `data.quote.price`、`data.change_pct`、`data.history` 自己分析。不要把 `AU9999`、`Au99.99` 传给 `context` / `analyze`，它们只支持股票、ETF 和指数代码。
+- `data.quote` 为 `null` 或 `data.warnings` 非空时，向用户说明实时价缺失、当前用的是最近收盘价（`last_close_date`）。`change_basis` 说明涨跌幅的计算口径。
 
 ## 每日例行流程
 

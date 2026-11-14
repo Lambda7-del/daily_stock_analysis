@@ -60,7 +60,7 @@
 | [图片识别 Prompt](image-extract-prompt.md) | 图片识别股票信息的 Prompt 与使用边界 |
 | [OpenClaw Skill 集成](openclaw-skill-integration.md) | OpenClaw / Skill 外部集成说明 |
 | [Grok Bot 集成](grok-bot-integration.md) | 2026-08-11 Grok Bot（AI teammate）与 DSA REST / DecisionSignal / Skill 的对接边界 |
-| [ChatGPT dot / 外部 Agent CLI](codex-dot-integration.md) | `python -m src.agent_cli` JSON 命令行：分析、复盘、持仓账本与风险；dot 持久电脑部署与定时任务、确认后记账规则 |
+| [ChatGPT dot / 外部 Agent CLI](codex-dot-integration.md) | `python -m src.agent_cli` JSON 命令行：分析、复盘、持仓账本与风险、上金所 Au99.99 金价；dot 持久电脑部署与定时任务、确认后记账规则 |
 
 ## 部署与打包
 

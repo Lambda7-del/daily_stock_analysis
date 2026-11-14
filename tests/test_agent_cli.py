@@ -132,6 +132,7 @@ class AgentCliParserTest(unittest.TestCase):
             ("portfolio", "cash-add", "--account-id", "1", "--event-date", "2026-11-13",
              "--direction", "in", "--amount", "10"): "portfolio cash-add",
             ("signal", "latest", "600519"): "signal latest",
+            ("gold", "--days", "5", "--no-realtime"): "gold",
         }
         for argv, expected in cases.items():
             with self.subTest(argv=argv):
@@ -397,6 +398,83 @@ class AgentCliAnalysisTest(unittest.TestCase):
         self.assertEqual(code, agent_cli.EXIT_OK, payload)
         self.assertEqual(payload["data"]["report"], "# review")
         self.assertIs(review.call_args.kwargs["send_notification"], False)
+
+
+class AgentCliGoldTest(unittest.TestCase):
+    @staticmethod
+    def _history() -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "date": [date(2026, 11, 11), date(2026, 11, 12), date(2026, 11, 13)],
+                "open": [876.0, 869.0, 847.8],
+                "high": [878.6, 871.4, 857.8],
+                "low": [862.05, 850.02, 829.98],
+                "close": [872.98, 851.33, 837.55],
+            }
+        )
+
+    def _fetcher(self, quote: Any = None, history: Any = None) -> MagicMock:
+        fetcher = MagicMock()
+        for attr, value in (("get_sge_spot_quote", quote), ("get_sge_spot_history", history)):
+            if isinstance(value, Exception):
+                getattr(fetcher, attr).side_effect = value
+            else:
+                getattr(fetcher, attr).return_value = value
+        return fetcher
+
+    def test_gold_returns_quote_and_history(self) -> None:
+        fetcher = self._fetcher(
+            quote={"symbol": "Au99.99", "price": 836.0, "time": "02:29:00", "updated_at": "x"},
+            history=self._history(),
+        )
+        with patch("data_provider.akshare_fetcher.AkshareFetcher", return_value=fetcher):
+            code, payload = _run(["gold", "--days", "2"])
+
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        data = payload["data"]
+        self.assertEqual(data["unit"], "CNY/g")
+        self.assertEqual(data["quote"]["price"], 836.0)
+        self.assertEqual([row["date"] for row in data["history"]], ["2026-11-12", "2026-11-13"])
+        self.assertEqual(data["change_basis"], "realtime_vs_last_close")
+        self.assertEqual(data["warnings"], [])
+
+    def test_gold_degrades_to_history_when_realtime_fails(self) -> None:
+        fetcher = self._fetcher(quote=TimeoutError("slow"), history=self._history())
+        with patch("data_provider.akshare_fetcher.AkshareFetcher", return_value=fetcher):
+            code, payload = _run(["gold"])
+
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        data = payload["data"]
+        self.assertIsNone(data["quote"])
+        self.assertEqual(data["change_basis"], "last_two_closes")
+        self.assertEqual(len(data["warnings"]), 1)
+        self.assertIn("slow", data["warnings"][0])
+
+    def test_gold_no_realtime_skips_quote(self) -> None:
+        fetcher = self._fetcher(history=self._history())
+        with patch("data_provider.akshare_fetcher.AkshareFetcher", return_value=fetcher):
+            code, payload = _run(["gold", "--no-realtime"])
+
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        fetcher.get_sge_spot_quote.assert_not_called()
+        self.assertEqual(payload["data"]["warnings"], [])
+
+    def test_gold_all_sources_failed_is_runtime_error(self) -> None:
+        fetcher = self._fetcher(quote=RuntimeError("q down"), history=RuntimeError("h down"))
+        with patch("data_provider.akshare_fetcher.AkshareFetcher", return_value=fetcher):
+            code, payload = _run(["gold"])
+
+        self.assertEqual(code, agent_cli.EXIT_RUNTIME_ERROR)
+        self.assertEqual(payload["error"]["type"], "data_unavailable")
+        self.assertIn("q down", payload["error"]["message"])
+        self.assertIn("h down", payload["error"]["message"])
+
+    def test_gold_days_out_of_range_is_usage_error(self) -> None:
+        for raw in ("0", "251", "abc"):
+            with self.subTest(days=raw):
+                code, payload = _run(["gold", "--days", raw])
+                self.assertEqual(code, agent_cli.EXIT_USAGE_ERROR)
+                self.assertEqual(payload["error"]["type"], "usage_error")
 
 
 class PerformMarketReviewNotificationTest(unittest.TestCase):

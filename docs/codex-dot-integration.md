@@ -6,7 +6,8 @@
 
 ## 能力边界
 
-- Agent CLI 只包装现有服务：个股分析、大盘复盘、持仓账本（账户 / 成交 / 资金）、持仓快照与风险报告、决策信号查询。不新增数据库表、配置项或 HTTP 接口。
+- Agent CLI 只包装现有服务：个股分析、大盘复盘、持仓账本（账户 / 成交 / 资金）、持仓快照与风险报告、决策信号查询，以及上海黄金交易所 Au99.99 行情（`gold`）。不新增数据库表、配置项或 HTTP 接口。
+- `gold` 只返回行情数据（元/克），不做分析：黄金现货不进入个股分析流水线，`analyze` / `context` 不支持 `AU9999`、`Au99.99` 这类代码（会被当作 A 股代码而取数失败）。需要黄金 ETF 的技术面分析时，对 `518880` 等 ETF 代码使用 `context` 即可，但其价格是基金份额价格而非元/克。
 - 推荐由 dot 自己充当分析模型：`context` 让 DSA 取数并生成与正常分析完全相同的提示词（不调用模型），dot 写出 JSON 结果后用 `analyze --responses` 交回，DSA 按标准流程解析、风控兜底、写入历史与决策信号。这样 DSA 不需要任何模型或搜索 key，也避免 "dot → DSA → 另一个模型" 的嵌套调用。
 - 持仓账本只记录**已确认的成交**，DSA 不对接券商下单。持仓写操作必须带 `--confirmed`，成交必须带 `--trade-uid` 以便重试去重。
 - `market-review` 默认不推送通知，结果由 Agent 自己转达；个股分析同样不推送。需要 DSA 自带的通知渠道时，仍可用 `python main.py`。
@@ -85,6 +86,7 @@ $PY -m src.agent_cli context --stocks 600519
 - SQLite 是单写者。dot 任务执行期间不要同时在 Web 端修改持仓，否则可能返回 `portfolio_busy`。
 - 报告文件名为 `reports/agent_report_<时间戳>.md`，不会覆盖 `main.py` 的 `report_<日期>.md`。
 - `analyze --responses` 会重新拉取行情再套用 dot 的结论，盘中两次运行之间价格可能变化；每日例行任务建议放在收盘后。历史记录中的 `model_used` 为 `--model-label` 的值（默认 `external_agent`）。
+- `gold` 数据来自 akshare 的上金所接口（`spot_quotations_sge` 实时分钟报价、`spot_hist_sge` 日线），不依赖任何 key。返回字段：`quote`（`price`、`time`、`updated_at`，未取到为 `null`）、`last_close` / `last_close_date`（最近日线收盘）、`change_pct` 与 `change_basis`（`realtime_vs_last_close` 或 `last_two_closes`）、`history`（最近 `--days` 条日线，默认 30，上限 250）、`warnings`（降级原因）。两路都失败时返回 `data_unavailable`（退出码 1）。上金所有夜盘，`quote.time` 只有时分秒，日期以 `updated_at` 为准。
 - `--no-realtime` 只用本地已存的历史收盘价计算市值；若本地还没有该股的日线数据，市值可能显示为 0。每日例行流程建议使用默认的实时行情，或先对持仓代码跑一次 `analyze` 以写入日线。
 
 ## 回滚
