@@ -40,7 +40,8 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 ## 个股分析交接（context → 你分析 → analyze --responses）
 
 1. 运行 `context --stocks <代码>`。`data.stocks[]` 每项给出 `system_prompt_path`、`prompt_path`、`response_path`；`data.failed` / `data.missing` 是没能生成上下文的代码，如实告诉用户。
-2. 对每只股票：读 `system_prompt_path`（分析规则与输出 JSON 格式）和 `prompt_path`（DSA 整理好的行情、均线、趋势、基本面、大盘与持仓上下文）。
+2. 对每只股票：读 `system_prompt_path`（分析规则与输出 JSON 格式）和 `prompt_path`（DSA 整理好的行情、均线、趋势、基本面与大盘上下文）。
+   - 提示词**不含**用户的持仓数量、成本和浮盈，这与 DSA 原有分析流程一致。`position_advice` 按提示词要求分别写空仓者和持仓者的通用建议，不要在 JSON 里写入用户的成本或仓位。
    - 提示词里"舆情情报"缺失时，用你自己的联网能力补查近 3 日的公告与新闻，并遵守提示词中的时间合规要求；查不到就按提示词说明"数据缺失"，不要编造。
    - 遵守提示词里的数据限制与置信度规则，不要编造未提供的数据。
 3. 把**一个**符合 system prompt 输出格式的 JSON 对象写入对应的 `response_path`（只写 JSON，不要 Markdown 代码块外的说明文字）。
@@ -57,10 +58,11 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 ## 每日例行流程
 
 1. `market-review`，基于其中的数据给出你自己的大盘判断（未配置模型时 DSA 返回数据模板报告）。
-2. `portfolio snapshot` 取出所有持仓代码，与用户的自选股合并去重。
+2. `portfolio snapshot` 取出所有持仓代码，与用户的自选股合并去重；保留每个持仓的 `quantity`、`avg_cost`、`unrealized_pnl_pct` 和 `market_value_base`，供第 5 步使用。
 3. 按上面的交接流程完成个股分析（多于 5 只时分批）。
 4. `portfolio risk`，关注集中度、回撤、止损告警。
 5. 汇总发给用户：大盘一句话结论；每个持仓的建议动作、关键点位和理由；风险告警；新机会（自选股中非持仓且建议买入的）。明确标注这些是建议，不是已执行的操作。
+   - DSA 报告里的仓位建议是通用的，不知道用户的成本和仓位。汇总持仓时，由你结合第 2 步的真实数据给出针对性建议：例如浮盈较大时止损位是否上移保护利润、被套时止损位离成本有多远、单只占比过高时是否先控仓（集中度以 `portfolio risk` 为准）。说明哪些结论来自 DSA 报告、哪些是你结合持仓做的调整。
 
 ## 硬规则
 
