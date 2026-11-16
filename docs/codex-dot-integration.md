@@ -11,10 +11,32 @@
 - 推荐由 dot 自己充当分析模型：`context` 让 DSA 取数并生成与正常分析完全相同的提示词（不调用模型），dot 写出 JSON 结果后用 `analyze --responses` 交回，DSA 按标准流程解析、风控兜底、写入历史与决策信号。这样 DSA 不需要任何模型或搜索 key，也避免 "dot → DSA → 另一个模型" 的嵌套调用。
 - 个股分析提示词不含持仓数量、成本与浮盈，与 `python main.py` 每日分析一致，报告中的仓位建议是"空仓者 / 持仓者"两套通用建议。结合真实持仓的建议由 dot 在每日汇总时基于 `portfolio snapshot` / `portfolio risk` 给出，见 Skill 示例。
 - 持仓账本只记录**已确认的成交**，DSA 不对接券商下单。持仓写操作必须带 `--confirmed`，成交必须带 `--trade-uid` 以便重试去重。
+- 持仓账本支持上金所 Au99.99 黄金：代码 `AU9999` / `Au99.99` 等价，数量以克、价格以元/克记录，市场使用 `cn`、币种使用 `CNY`。黄金 ETF 仍按基金份额记账，两者不合并。
 - `market-review` 默认不推送通知，结果由 Agent 自己转达；个股分析同样不推送。需要 DSA 自带的通知渠道时，仍可用 `python main.py`。
 - Agent 工具调用（问股 Agent）、图片识别不在本入口范围内。
 
 命令、输出格式和硬规则见 Skill 示例：[`docs/examples/codex_dot/SKILL.md`](examples/codex_dot/SKILL.md)。
+
+## 黄金记账与估值
+
+复用现有 `cn` / `CNY` 账户和 `portfolio trade-add`，不需要 `gold` / `sge` 市场或新的数据库表。以下为成交参数示例，仅在用户确认实际成交后执行，替换账户 ID、日期、数量、价格与唯一成交号：
+
+```bash
+$DSA_PY -m src.agent_cli portfolio trade-add \
+  --account-id 1 --symbol Au99.99 --trade-date 2026-11-16 \
+  --side buy --quantity 1.5 --price 900 --market cn --currency CNY \
+  --trade-uid gold-20261116-AU9999-buy-1 --confirmed
+$DSA_PY -m src.agent_cli portfolio snapshot --account-id 1
+```
+
+- 新成交统一保存为 `AU9999`，已有 `AU99.99` / `AU9999` 记录在持仓重放、卖出校验和交易查询时合并识别，无需改写旧流水。小数克数、手续费、FIFO / 平均成本、部分卖出与 `trade_uid` 去重沿用原账本规则；股票分红和拆股操作不适用于黄金。
+- 黄金交易及持仓输出附加 `asset_type=gold`、`quantity_unit=g`、`price_unit=CNY/g`。同样适用于现有 HTTP 持仓接口；旧客户端可忽略这些可选字段。交易必须是 `cn` / `CNY`；旧账中其他市场或币种的黄金不会被自动换义，快照以 `gold_requires_cn_cny` 标记，需要核对原始成交后更正。
+- 默认的当日 `portfolio snapshot` / `portfolio risk` 为持有黄金的账户查询上金所报价，同时缓存接口返回的完整日线；多个账户共用本次黄金查询。全局 `ENABLE_REALTIME_QUOTE=false` 时不发起黄金查询。独立 `gold` 命令仍只取数，不写入账本行情缓存。
+- `--no-realtime`、历史 `--as-of` 和只读快照只使用本地缓存；先获取一次默认当日快照可补齐黄金日线。历史估值只选指定日期及以前的收盘价，绝不拿当前金价回填过去。实时报价使用上游 `updated_at` 的日期，缺少有效日期或晚于估值日期的报价不参与估值，旧报价也不会覆盖较新的日线。
+- 实时报价失败时使用缓存收盘价；无可用价格时 `price_available=false`、`price_source=missing`、`data_quality=partial`、`limitations` 含 `gold_price_unavailable`，市值占位为 0，浮盈比例为空。缺价不等于价值归零，不能据此解释收益或完整资产占比，也不会生成“亏损 100%”的止损告警。
+- 黄金纳入市值、盈亏、集中度和基于成本的止损计算，行业分组显示为“黄金”，不查询股票板块或股票决策信号。持仓个股分析接口对黄金返回校验错误；dot 应使用 `gold` 自行分析，不能把黄金交给 `context` / `analyze`。
+- 风险报告追加 `data_quality` / `limitations`。回撤计算排除黄金缺价的整个日期（`drawdown.excluded_gold_dates`），并标记 `historical_gold_price_unavailable`；补齐日线后会重建此前缺价的历史快照，避免沿用旧版本的零市值。
+- 估值基准为上金所 Au99.99；不自动代表银行积存金赎回价、金饰回购价、国际金价或黄金期货。成交成本按用户实际价格与费用记录。
 
 ## 部署步骤
 
@@ -92,4 +114,4 @@ $PY -m src.agent_cli context --stocks 600519
 
 ## 回滚
 
-Agent CLI 不引入数据迁移。停用 dot 定时任务即可停止调用；持仓数据仍在 `DATABASE_PATH` 中，可继续通过 Web 端或 API 使用。
+Agent CLI 不引入数据迁移。停用 dot 定时任务即可停止调用；持仓数据仍在 `DATABASE_PATH` 中，可继续通过 Web 端或 API 使用。回退黄金兼容代码也不需要删除流水或缓存，但旧版本不再合并黄金别名或获取金价，黄金估值和风险结果不应继续使用。

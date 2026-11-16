@@ -136,6 +136,132 @@ class PortfolioServiceTestCase(unittest.TestCase):
         self.assertEqual(pos["price_provider"], "unit-test")
         self.assertTrue(pos["price_available"])
 
+    def test_gold_aliases_replay_legacy_lots_and_fractional_sales(self) -> None:
+        aid = self._create_account_with_position(
+            market="cn", currency="CNY", symbol="Au99.99", quantity=1.5, price=800,
+        )
+        # Existing rows used AU99.99; the upgrade must work without rewriting the ledger.
+        with self.db.get_session() as session:
+            row = session.execute(select(PortfolioTrade)).scalar_one()
+            row.symbol = "AU99.99"
+            row.fee = 3
+            session.commit()
+        self.service.record_trade(
+            account_id=aid, symbol="au9999", trade_date=date(2026, 1, 3), side="buy",
+            quantity=0.5, price=900, fee=1, trade_uid="gold-buy-2",
+        )
+        sale = dict(account_id=aid, symbol="AU9999", trade_date=date(2026, 1, 4),
+                    side="sell", quantity=0.75, price=1000, fee=2, trade_uid="gold-sell")
+        self.service.record_trade(**sale)
+        with self.assertRaises(PortfolioConflictError):
+            self.service.record_trade(**sale)
+        with self.assertRaises(PortfolioOversellError):
+            self.service.record_trade(**{**sale, "trade_uid": "oversell", "quantity": 2})
+        self._save_close("AU9999", date(2026, 1, 4), 950)
+
+        for method, cost, realized in (("fifo", 1052.5, 146.5), ("avg", 1033.75, 127.75)):
+            with self.subTest(method=method):
+                snapshot = self.service.get_portfolio_snapshot(
+                    account_id=aid, as_of=date(2026, 1, 4), cost_method=method, include_realtime=False,
+                )
+                self.assertEqual(len(snapshot["accounts"][0]["positions"]), 1)
+                pos = snapshot["accounts"][0]["positions"][0]
+                self.assertEqual((pos["symbol"], pos["asset_type"], pos["quantity_unit"], pos["price_unit"]),
+                                 ("AU9999", "gold", "g", "CNY/g"))
+                self.assertAlmostEqual(pos["quantity"], 1.25)
+                self.assertAlmostEqual(pos["total_cost"], cost)
+                self.assertAlmostEqual(pos["market_value_base"], 1187.5)
+                self.assertAlmostEqual(snapshot["realized_pnl"], realized)
+                self.assertAlmostEqual(snapshot["unrealized_pnl"], 1187.5 - cost)
+                self.assertAlmostEqual(snapshot["total_cash"], 99094)
+        for alias in ("AU9999", "Au99.99"):
+            events = self.service.list_trade_events(account_id=aid, symbol=alias)
+            self.assertEqual(events["total"], 3)
+            self.assertTrue(all(row["symbol"] == "AU9999" for row in events["items"]))
+
+    def test_gold_realtime_cache_and_historical_snapshot_use_sge_only(self) -> None:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        aid = self._create_account_with_position(
+            market="cn", currency="CNY", symbol="AU9999", quantity=1.5, price=800,
+        )
+        self._create_account_with_position(market="cn", currency="CNY", symbol="Au99.99")
+        quotes = pd.DataFrame([{"现价": 950, "时间": "02:29:00", "更新时间": f"{today:%Y年%m月%d日} 02:29:55"}])
+        history = pd.DataFrame([
+            {"date": yesterday, "open": 900, "high": 900, "low": 900, "close": 900},
+            {"date": today, "open": 940, "high": 940, "low": 940, "close": 940},
+        ])
+        with patch("data_provider.akshare_fetcher._akshare_call_with_timeout", side_effect=[quotes, history]) as remote, \
+                patch("data_provider.base.DataFetcherManager.get_realtime_quote", side_effect=AssertionError("stock route")):
+            snapshot = self.service.get_portfolio_snapshot()
+        self.assertEqual(remote.call_count, 2, "gold requests should be shared by all accounts")
+        pos = snapshot["accounts"][0]["positions"][0]
+        self.assertEqual(pos["last_price"], 950)
+        self.assertEqual(pos["price_provider"], "akshare:SGE")
+        self.assertEqual(pos["price_date"], today.isoformat())
+        self.assertFalse(pos["price_stale"])
+        self.assertEqual(pos["market_value_base"], 1425)
+
+        with patch("data_provider.akshare_fetcher._akshare_call_with_timeout", side_effect=AssertionError("offline")):
+            historical = self.service.get_portfolio_snapshot(account_id=aid, as_of=yesterday)
+            offline = self.service.get_portfolio_snapshot(account_id=aid, include_realtime=False)
+            with patch.object(self.service.repo, "replace_positions_lots_and_snapshot") as write:
+                readonly = self.service.get_portfolio_snapshot(account_id=aid, read_only=True)
+                write.assert_not_called()
+        past = historical["accounts"][0]["positions"][0]
+        self.assertEqual((past["last_price"], past["price_date"]), (900, yesterday.isoformat()))
+        for data in (offline, readonly):
+            self.assertEqual(data["accounts"][0]["positions"][0]["last_price"], 940)
+
+    def test_gold_quote_failure_and_stale_dates_do_not_fabricate_value(self) -> None:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        aid = self._create_account_with_position(market="cn", currency="CNY", symbol="AU9999")
+        with patch("data_provider.akshare_fetcher._akshare_call_with_timeout", side_effect=TimeoutError("offline")):
+            missing = self.service.get_portfolio_snapshot(account_id=aid)
+            self._save_close("AU9999", yesterday, 900)
+            cached = self.service.get_portfolio_snapshot(account_id=aid)
+        pos = missing["accounts"][0]["positions"][0]
+        self.assertFalse(pos["price_available"])
+        self.assertIn("gold_price_unavailable", missing["limitations"])
+        self.assertEqual(missing["data_quality"], "partial")
+        pos = cached["accounts"][0]["positions"][0]
+        self.assertEqual((pos["last_price"], pos["price_source"]), (900, "history_close"))
+        self.assertTrue(pos["price_stale"])
+
+        for stamp, expected in (("unknown", 900), ((today + timedelta(days=1)).isoformat(), 900),
+                                ((yesterday - timedelta(days=1)).isoformat(), 900),
+                                (yesterday.isoformat(), 910)):
+            with self.subTest(stamp=stamp):
+                quote = pd.DataFrame([{"现价": 910, "更新时间": stamp}])
+                with patch("data_provider.akshare_fetcher._akshare_call_with_timeout",
+                           side_effect=[quote, TimeoutError("history offline")]):
+                    snapshot = self.service.get_portfolio_snapshot(account_id=aid)
+                pos = snapshot["accounts"][0]["positions"][0]
+                self.assertEqual(pos["last_price"], expected)
+                self.assertTrue(pos["price_stale"])
+
+    def test_gold_rejects_wrong_market_currency_and_stock_actions(self) -> None:
+        aid = self._create_account_with_position(market="cn", currency="CNY", symbol="AU9999")
+        for market, currency in (("us", "USD"), ("cn", "USD"), ("hk", "CNY")):
+            with self.subTest(market=market, currency=currency), self.assertRaisesRegex(ValueError, "market=cn"):
+                self.service.record_trade(account_id=aid, symbol="Au99.99", trade_date=date.today(),
+                                          side="buy", quantity=1, price=900, market=market, currency=currency)
+        with self.assertRaisesRegex(ValueError, "dividends or splits"):
+            self.service.record_corporate_action(account_id=aid, symbol="AU9999", effective_date=date.today(),
+                                                 action_type="split_adjustment", split_ratio=2)
+
+        # Incorrect legacy currency must never turn a CNY/g quote into a USD/g valuation.
+        with self.db.get_session() as session:
+            row = session.execute(select(PortfolioTrade)).scalar_one()
+            row.currency = "USD"
+            session.commit()
+        self._save_close("AU9999", date.today(), 900)
+        with patch.object(self.service, "_convert_amount", side_effect=lambda **kw: (kw["amount"], False, 1)):
+            snapshot = self.service.get_portfolio_snapshot(account_id=aid, include_realtime=False)
+        self.assertFalse(snapshot["accounts"][0]["positions"][0]["price_available"])
+        self.assertIn("gold_requires_cn_cny", snapshot["limitations"])
+
     def test_current_snapshot_prefers_realtime_price_over_stale_close(self) -> None:
         today = date.today()
         account = self.service.create_account(name="Main", broker="Demo", market="cn", base_currency="CNY")

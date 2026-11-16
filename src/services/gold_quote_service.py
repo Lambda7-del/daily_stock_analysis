@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -14,6 +16,27 @@ logger = logging.getLogger(__name__)
 GOLD_SYMBOL = "Au99.99"
 GOLD_UNIT = "CNY/g"
 GOLD_SOURCE = "akshare:SGE"
+GOLD_LEDGER_SYMBOL = "AU9999"
+GOLD_ALIASES = (GOLD_LEDGER_SYMBOL, "AU99.99")
+
+
+def is_gold_symbol(symbol: str) -> bool:
+    """Only SGE Au99.99 aliases; ETFs, futures and overseas gold stay distinct."""
+    return (symbol or "").strip().upper() in GOLD_ALIASES
+
+
+def gold_quote_date(quote: Dict[str, Any]) -> Optional[date]:
+    """Use the provider's update date, never the local fetch date (SGE has night sessions)."""
+    match = re.match(
+        r"^(\d{4})[-年/](\d{1,2})[-月/](\d{1,2})(?:日|(?=[T\s]|$))",
+        str(quote.get("updated_at") or ""),
+    )
+    if match:
+        try:
+            return date(*(int(part) for part in match.groups()))
+        except ValueError:
+            pass
+    return None
 
 
 class GoldQuoteUnavailableError(RuntimeError):
@@ -30,13 +53,14 @@ def _pct_change(current: float, base: float) -> Optional[float]:
     return _round((current - base) / base * 100)
 
 
-def get_gold_quote(days: int = 30, realtime: bool = True, fetcher: Any = None) -> Dict[str, Any]:
+def get_gold_quote(days: Optional[int] = 30, realtime: bool = True, fetcher: Any = None) -> Dict[str, Any]:
     """返回 Au99.99 的最新报价与最近 ``days`` 条日线。
 
+    ``days=None`` 供账本缓存完整日线；CLI 仍限制最多 250 条。
     任一路失败会记入 ``warnings`` 并降级；两路都失败时抛出
     ``GoldQuoteUnavailableError``，不返回空结果。
     """
-    if days < 1:
+    if days is not None and days < 1:
         raise ValueError(f"days 必须 >= 1: {days}")
     if fetcher is None:
         from data_provider.akshare_fetcher import AkshareFetcher
@@ -58,7 +82,8 @@ def get_gold_quote(days: int = 30, realtime: bool = True, fetcher: Any = None) -
     recent: List[Dict[str, Any]] = []
     try:
         df = fetcher.get_sge_spot_history(GOLD_SYMBOL)
-        for row in df.tail(max(days, 2)).itertuples(index=False):
+        history_df = df if days is None else df.tail(max(days, 2))
+        for row in history_df.itertuples(index=False):
             recent.append(
                 {
                     "date": row.date.isoformat(),
@@ -86,7 +111,7 @@ def get_gold_quote(days: int = 30, realtime: bool = True, fetcher: Any = None) -
     elif len(recent) >= 2:
         change_pct = _pct_change(recent[-1]["close"], recent[-2]["close"])
         change_basis = "last_two_closes"
-    history = recent[-days:]
+    history = recent if days is None else recent[-days:]
 
     return {
         "symbol": GOLD_SYMBOL,

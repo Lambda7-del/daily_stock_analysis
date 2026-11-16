@@ -31,6 +31,9 @@ export interface PortfolioAccountCreateRequest {
 
 export interface PortfolioPositionItem {
   symbol: string;
+  assetType?: string | null;
+  quantityUnit?: string | null;
+  priceUnit?: string | null;
   market: string;
   currency: string;
   quantity: number;
@@ -114,6 +117,7 @@ export interface PortfolioSectorConcentrationItem {
 }
 
 export interface PortfolioDrawdownBlock {
+  excludedGoldDates?: number;
   seriesPoints: number;
   maxDrawdownPct: number;
   currentDrawdownPct: number;
@@ -151,6 +155,8 @@ export interface PortfolioDecisionSignalRiskBlock {
 }
 
 export interface PortfolioRiskResponse {
+  dataQuality?: 'ok' | 'partial' | string;
+  limitations?: string[];
   asOf: string;
   accountId?: number | null;
   costMethod: PortfolioCostMethod;
@@ -229,6 +235,9 @@ export interface PortfolioTradeListItem {
   accountId: number;
   tradeUid?: string | null;
   symbol: string;
+  assetType?: string | null;
+  quantityUnit?: string | null;
+  priceUnit?: string | null;
   market: string;
   currency: string;
   tradeDate: string;

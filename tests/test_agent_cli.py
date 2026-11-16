@@ -140,6 +140,32 @@ class AgentCliParserTest(unittest.TestCase):
 
 
 class AgentCliPortfolioTest(_TempDbTestCase):
+    def test_gold_ledger_cli_flow(self) -> None:
+        account_id = self._create_account()
+        args = self._trade_args(account_id, **{
+            "--symbol": "Au99.99", "--quantity": "1.5", "--price": "800",
+        })
+        code, payload = _run(args)
+        self.assertEqual(payload["error"]["type"], "confirmation_required")
+        code, payload = _run(args + ["--confirmed"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        code, payload = _run(args + ["--confirmed"])
+        self.assertEqual(payload["error"]["type"], "already_recorded")
+        code, payload = _run(self._trade_args(account_id, **{
+            "--symbol": "AU9999", "--side": "sell", "--quantity": "0.5", "--price": "900",
+            "--trade-uid": "gold-sell",
+        }) + ["--confirmed"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        code, payload = _run(["portfolio", "trades", "--account-id", str(account_id), "--symbol", "au99.99"])
+        self.assertEqual(payload["data"]["total"], 2)
+        self.assertEqual(payload["data"]["items"][0]["price_unit"], "CNY/g")
+        code, payload = _run(["portfolio", "snapshot", "--account-id", str(account_id), "--no-realtime"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        pos = payload["data"]["accounts"][0]["positions"][0]
+        self.assertEqual((pos["symbol"], pos["quantity"], pos["quantity_unit"]), ("AU9999", 1.0, "g"))
+        self.assertEqual(payload["data"]["realized_pnl"], 50)
+        self.assertFalse(pos["price_available"])
+
     def test_write_commands_require_confirmation(self) -> None:
         code, payload = _run(
             ["portfolio", "account-create", "--name", "x", "--market", "cn", "--base-currency", "CNY"]

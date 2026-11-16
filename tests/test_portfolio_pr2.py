@@ -7,7 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -40,6 +40,46 @@ def _reset_auth_globals() -> None:
 
 class PortfolioPr2TestCase(unittest.TestCase):
     """End-to-end style tests for PR2 import, dedup, risk and fx behavior."""
+
+    def test_gold_risk_uses_gold_sector_and_skips_stock_signals(self) -> None:
+        service = PortfolioService()
+        account = service.create_account(name="Gold", broker=None, market="cn", base_currency="CNY")
+        service.record_trade(account_id=account["id"], symbol="Au99.99", trade_date=date.today(),
+                             side="buy", quantity=1.5, price=800)
+        risk = PortfolioRiskService(portfolio_service=service)
+        risk.config.portfolio_risk_lookback_days = 0
+        with patch.object(risk, "_fetch_belong_boards", side_effect=AssertionError("stock sector")), \
+                patch.object(risk.decision_signal_service, "list_signals", side_effect=AssertionError("stock signal")):
+            missing = risk.get_risk_report(account_id=account["id"], include_realtime=False)
+            self.assertEqual(missing["stop_loss"]["triggered_count"], 0)
+            service.repo.save_gold_history([{"date": date.today(), "close": 600}])
+            report = risk.get_risk_report(account_id=account["id"], include_realtime=False)
+        self.assertEqual(report["concentration"]["top_positions"][0]["symbol"], "AU9999")
+        self.assertEqual(report["sector_concentration"]["top_sectors"][0]["sector"], "黄金")
+        self.assertEqual(report["stop_loss"]["items"][0]["loss_pct"], 25)
+        self.assertEqual(report["decision_signal_risk"]["items"], [])
+
+    def test_gold_drawdown_repairs_missing_cached_valuations(self) -> None:
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        aid = self.service.create_account(name="Gold", broker=None, market="cn", base_currency="CNY")["id"]
+        self.service.record_cash_ledger(account_id=aid, event_date=yesterday, direction="in", amount=1500)
+        self.service.record_trade(account_id=aid, symbol="Au99.99", trade_date=yesterday,
+                                  side="buy", quantity=1.5, price=800)
+        self.service.get_portfolio_snapshot(account_id=aid, as_of=yesterday, include_realtime=False)
+        self.risk_service.config.portfolio_risk_lookback_days = 2
+        missing = self.risk_service.get_risk_report(account_id=aid, include_realtime=False)
+        self.assertEqual(missing["drawdown"]["series_points"], 0)
+        self.assertEqual(missing["drawdown"]["excluded_gold_dates"], 2)
+        self.assertIn("historical_gold_price_unavailable", missing["limitations"])
+        self.service.repo.save_gold_history([
+            {"date": yesterday, "close": 900}, {"date": today, "close": 800},
+        ])
+        repaired = self.risk_service.get_risk_report(account_id=aid, include_realtime=False)
+        self.assertEqual(repaired["drawdown"]["series_points"], 2)
+        self.assertEqual(repaired["drawdown"]["excluded_gold_dates"], 0)
+        self.assertAlmostEqual(repaired["drawdown"]["max_drawdown_pct"], 100 * 150 / 1650, places=4)
+        self.assertEqual(repaired["data_quality"], "ok")
 
     def setUp(self) -> None:
         _reset_auth_globals()

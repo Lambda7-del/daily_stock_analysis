@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import date, timedelta
@@ -13,6 +14,7 @@ from src.config import Config, get_config
 from src.repositories.portfolio_repo import PortfolioRepository
 from src.services.decision_signal_service import DecisionSignalService
 from src.services.decision_signal_summary import summarize_decision_signal
+from src.services.gold_quote_service import GOLD_LEDGER_SYMBOL, is_gold_symbol
 from src.services.portfolio_service import PortfolioService
 
 logger = logging.getLogger(__name__)
@@ -95,12 +97,17 @@ class PortfolioRiskService:
         )
         stop_loss = self._build_stop_loss(snapshot, thresholds)
         decision_signal_risk = self._build_decision_signal_risk(snapshot)
+        limitations = list(snapshot.get("limitations", []))
+        if drawdown.get("excluded_gold_dates"):
+            limitations.append("historical_gold_price_unavailable")
 
         return {
             "as_of": as_of_date.isoformat(),
             "account_id": account_id,
             "cost_method": cost_method,
             "currency": snapshot["currency"],
+            "data_quality": "partial" if limitations else "ok",
+            "limitations": limitations,
             "thresholds": thresholds,
             "concentration": concentration,
             "sector_concentration": sector_concentration,
@@ -198,7 +205,7 @@ class PortfolioRiskService:
             for pos in account.get("positions", []) or []:
                 symbol = str(pos.get("symbol") or "").strip().upper()
                 market = str(pos.get("market") or "").strip().lower()
-                if not symbol or market not in {"cn", "hk", "us"}:
+                if not symbol or is_gold_symbol(symbol) or market not in {"cn", "hk", "us"}:
                     continue
                 signal_stock_code = DecisionSignalService.normalize_stock_code_for_signal(symbol, market=market)
                 positions.append({
@@ -235,6 +242,12 @@ class PortfolioRiskService:
             account_id=account_id,
             lookback_days=lookback_days,
         )
+        # A previous version (or an offline call) may have cached a zero-valued
+        # gold position. Rebuild that date once a usable close becomes available.
+        existing_rows = [row for row in existing_rows if not (
+            self._snapshot_missing_gold(row)
+            and self.repo.get_latest_close_with_date(GOLD_LEDGER_SYMBOL, row.snapshot_date) is not None
+        )]
         if account_id is not None:
             existing_dates = {row.snapshot_date for row in existing_rows if int(row.account_id) == int(account_id)}
             current_date = start_date
@@ -408,6 +421,11 @@ class PortfolioRiskService:
         if cache_key in board_cache:
             return board_cache[cache_key]
 
+        if is_gold_symbol(symbol):
+            coverage["classified_count"] += 1
+            board_cache[cache_key] = "黄金"
+            return board_cache[cache_key]
+
         if market != "cn":
             coverage["unclassified_count"] += 1
             board_cache[cache_key] = "UNCLASSIFIED"
@@ -494,6 +512,15 @@ class PortfolioRiskService:
             self._data_manager_init_error = str(exc)
             return None
 
+    @staticmethod
+    def _snapshot_missing_gold(row: Any) -> bool:
+        payload = json.loads(getattr(row, "payload", None) or "{}")
+        return any(
+            is_gold_symbol(pos.get("symbol", ""))
+            and (pos.get("price_available") is False or float(pos.get("last_price") or 0) <= 0)
+            for pos in payload.get("positions", [])
+        )
+
     def _build_drawdown(
         self,
         *,
@@ -520,7 +547,12 @@ class PortfolioRiskService:
 
         grouped: Dict[str, float] = {}
         stale_flag = False
+        missing_gold_dates = {row.snapshot_date for row in rows if self._snapshot_missing_gold(row)}
         for row in rows:
+            # Exclude the entire date when aggregating accounts, not just the
+            # unpriced account, which would create an artificial equity drop.
+            if row.snapshot_date in missing_gold_dates:
+                continue
             key = row.snapshot_date.isoformat()
             converted, stale, _ = self.portfolio_service.convert_amount(
                 amount=float(row.total_equity or 0.0),
@@ -546,6 +578,7 @@ class PortfolioRiskService:
 
         return {
             "series_points": len(series),
+            "excluded_gold_dates": len(missing_gold_dates),
             "max_drawdown_pct": round(max_drawdown, 4),
             "current_drawdown_pct": round(current_drawdown, 4),
             "alert": bool(max_drawdown >= threshold_pct),
@@ -563,7 +596,7 @@ class PortfolioRiskService:
             for pos in account.get("positions", []):
                 avg_cost = float(pos.get("avg_cost", 0.0) or 0.0)
                 last_price = float(pos.get("last_price", 0.0) or 0.0)
-                if avg_cost <= 0:
+                if avg_cost <= 0 or last_price <= 0 or pos.get("price_available") is False:
                     continue
                 loss_pct = max(0.0, (avg_cost - last_price) / avg_cost * 100.0)
                 if loss_pct < near_threshold:

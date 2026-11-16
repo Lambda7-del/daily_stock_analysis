@@ -11,7 +11,7 @@ import pandas as pd
 
 from data_provider.akshare_fetcher import AkshareFetcher
 from data_provider.base import DataFetchError
-from src.services.gold_quote_service import GoldQuoteUnavailableError, get_gold_quote
+from src.services.gold_quote_service import GoldQuoteUnavailableError, get_gold_quote, gold_quote_date, is_gold_symbol
 
 
 def _raw_history() -> pd.DataFrame:
@@ -40,6 +40,16 @@ def _raw_quotations() -> pd.DataFrame:
 
 
 class SgeFetcherTest(unittest.TestCase):
+    def test_ledger_identity_and_quote_dates(self) -> None:
+        for symbol in ("AU9999", "Au99.99", " au9999 "):
+            self.assertTrue(is_gold_symbol(symbol))
+        for symbol in ("518880", "AU", "GC=F", "XAUUSD"):
+            self.assertFalse(is_gold_symbol(symbol))
+        for stamp in ("2026年11月16日 02:29:55", "2026-11-16T02:29:55", "2026-11-16"):
+            self.assertEqual(gold_quote_date({"updated_at": stamp}), date(2026, 11, 16))
+        for stamp in ("", "unknown", "2026-02-30", "02:29:55"):
+            self.assertIsNone(gold_quote_date({"updated_at": stamp}))
+
     def setUp(self) -> None:
         self.fetcher = AkshareFetcher(sleep_min=0, sleep_max=0)
 
@@ -80,6 +90,15 @@ class SgeFetcherTest(unittest.TestCase):
 
 
 class GoldQuoteServiceTest(unittest.TestCase):
+    def test_ledger_can_request_full_history(self) -> None:
+        history = pd.DataFrame({
+            "date": pd.date_range("2025-01-01", periods=300).date,
+            "open": 900, "high": 900, "low": 900, "close": 900,
+        })
+        data = get_gold_quote(days=None, realtime=False, fetcher=self._fetcher(history=history))
+        self.assertEqual(len(data["history"]), 300)
+        self.assertEqual(data["history"][0]["date"], "2025-01-01")
+
     def _fetcher(self, quote=None, history=None) -> MagicMock:
         fetcher = MagicMock()
         for attr, value in (("get_sge_spot_quote", quote), ("get_sge_spot_history", history)):

@@ -1,6 +1,6 @@
 ---
 name: daily-stock-analysis-cli
-description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：由 DSA 取数并组装分析上下文，你自己完成个股分析后交回 DSA 入库，再做持仓快照与风险检查，并在用户确认成交后记账。也可查询上金所 Au99.99 黄金行情（元/克）。当用户要求分析股票、做每日复盘、查看或调整持仓记录、查询国内金价时使用。
+description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：由 DSA 取数并组装分析上下文，你自己完成个股分析后交回 DSA 入库，再做持仓快照与风险检查，并在用户确认成交后记账。支持上金所 Au99.99 黄金行情（元/克）及按克记账。当用户要求分析股票、做每日复盘、查看或调整股票与黄金持仓、查询国内金价时使用。
 ---
 
 # daily_stock_analysis Agent CLI
@@ -35,6 +35,7 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 | 某股最新决策信号 | `signal latest 600519` |
 | 创建账户（写） | `portfolio account-create --name X --market cn --base-currency CNY --confirmed` |
 | 记录成交（写） | `portfolio trade-add --account-id N --symbol 600519 --trade-date 2026-11-13 --side buy --quantity 100 --price 1435.26 [--fee F] [--tax T] --trade-uid UID --confirmed` |
+| 记录黄金成交（写，克 / 元每克） | `portfolio trade-add --account-id N --symbol AU9999 --market cn --currency CNY --trade-date 2026-11-16 --side buy --quantity 1.5 --price 900 --trade-uid UID --confirmed` |
 | 记录资金转入/转出（写） | `portfolio cash-add --account-id N --event-date 2026-11-13 --direction in --amount 100000 --confirmed` |
 
 ## 个股分析交接（context → 你分析 → analyze --responses）
@@ -50,16 +51,20 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 
 `analyze` 的 `data.results[]` 里，结论读 `operation_advice` / `action`（八态 `buy|add|hold|reduce|sell|watch|avoid|alert`）、`sentiment_score`、`trend_prediction`，点位读 `battle_plan`。
 
-## 黄金行情
+## 黄金行情与记账
 
 - 用户问金价（元/克）时调用 `gold`，基于 `data.quote.price`、`data.change_pct`、`data.history` 自己分析。不要把 `AU9999`、`Au99.99` 传给 `context` / `analyze`，它们只支持股票、ETF 和指数代码。
 - `data.quote` 为 `null` 或 `data.warnings` 非空时，向用户说明实时价缺失、当前用的是最近收盘价（`last_close_date`）。`change_basis` 说明涨跌幅的计算口径。
+- 已确认的黄金成交用 `portfolio trade-add`，代码 `Au99.99` / `AU9999` 等价，输出统一为 `AU9999`；使用 `cn` / `CNY`，`quantity` 是克，`price` 是元/克，费用单独记录。不要按手数、盎司或 ETF 份额填入，也不要把黄金 ETF 合并到现货黄金。
+- 黄金持仓输出 `asset_type=gold`、`quantity_unit=g`、`price_unit=CNY/g`。当日默认 `portfolio snapshot` 会查询金价并缓存日线；历史 `--as-of` / `--no-realtime` 只使用缓存，独立 `gold` 查询不会写缓存。
+- `price_available=false` 表示缺价，不能把占位市值 0 解释为黄金价值归零，不能据此下完整仓位或收益结论；`price_stale=true` 时注明 `price_date`。`gold_requires_cn_cny` 表示旧流水币种或市场不兼容，先向用户核对，不自行换算或重写。
+- 账本以 Au99.99 作为估值基准；银行积存金、实物金回购价及工费可能不同，向用户明确所用基准。
 
 ## 每日例行流程
 
 1. `market-review`，基于其中的数据给出你自己的大盘判断（未配置模型时 DSA 返回数据模板报告）。
-2. `portfolio snapshot` 取出所有持仓代码，与用户的自选股合并去重；保留每个持仓的 `quantity`、`avg_cost`、`unrealized_pnl_pct` 和 `market_value_base`，供第 5 步使用。
-3. 按上面的交接流程完成个股分析（多于 5 只时分批）。
+2. `portfolio snapshot` 取出持仓；把 `asset_type=gold` 或代码为 `AU9999` / `AU99.99` 的黄金单独取出，其余代码与用户自选股合并去重；保留每个持仓的 `quantity`、单位、`avg_cost`、`unrealized_pnl_pct`、`market_value_base` 及价格可用性，供第 5 步使用。自选列表中的黄金也按同一规则分流。
+3. 股票 / ETF 按上面的交接流程完成个股分析（多于 5 只时分批）；黄金单独调用 `gold`，结合按克持仓自行分析，不进入 `context` / `analyze`。
 4. `portfolio risk`，关注集中度、回撤、止损告警。
 5. 汇总发给用户：大盘一句话结论；每个持仓的建议动作、关键点位和理由；风险告警；新机会（自选股中非持仓且建议买入的）。明确标注这些是建议，不是已执行的操作。
    - DSA 报告里的仓位建议是通用的，不知道用户的成本和仓位。汇总持仓时，由你结合第 2 步的真实数据给出针对性建议：例如浮盈较大时止损位是否上移保护利润、被套时止损位离成本有多远、单只占比过高时是否先控仓（集中度以 `portfolio risk` 为准）。说明哪些结论来自 DSA 报告、哪些是你结合持仓做的调整。

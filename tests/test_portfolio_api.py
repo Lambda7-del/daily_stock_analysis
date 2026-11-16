@@ -124,6 +124,31 @@ class PortfolioApiTestCase(unittest.TestCase):
         self._save_close(symbol, date(2026, 1, 3), 110.0)
         return account_id
 
+    def test_gold_ledger_api_metadata_and_analysis_boundary(self) -> None:
+        aid = self._create_position(symbol="Au99.99", quantity=1.5)
+        self._save_close("AU9999", date(2026, 1, 3), 110)
+        sale = self.client.post("/api/v1/portfolio/trades", json={
+            "account_id": aid, "symbol": "AU9999", "trade_date": "2026-01-03",
+            "side": "sell", "quantity": 0.5, "price": 120, "trade_uid": "gold-sale",
+        })
+        self.assertEqual(sale.status_code, 200, sale.text)
+        snapshot = self.client.get("/api/v1/portfolio/snapshot", params={
+            "account_id": aid, "as_of": "2026-01-03", "include_realtime": False,
+        })
+        self.assertEqual(snapshot.status_code, 200, snapshot.text)
+        pos = snapshot.json()["accounts"][0]["positions"][0]
+        self.assertEqual((pos["symbol"], pos["quantity"], pos["quantity_unit"], pos["price_unit"]),
+                         ("AU9999", 1.0, "g", "CNY/g"))
+        self.assertEqual(pos["asset_type"], "gold")
+        self.assertEqual(pos["market_value_base"], 110)
+        trades = self.client.get("/api/v1/portfolio/trades", params={"account_id": aid, "symbol": "Au99.99"})
+        self.assertEqual(trades.json()["total"], 2)
+        self.assertEqual(trades.json()["items"][0]["asset_type"], "gold")
+        with patch("api.v1.endpoints.portfolio.get_task_queue") as queue:
+            response = self.client.post("/api/v1/portfolio/positions/Au99.99/analysis", json={"account_id": aid})
+        self.assertEqual(response.status_code, 400, response.text)
+        queue.assert_not_called()
+
     def test_account_event_snapshot_flow(self) -> None:
         create_resp = self.client.post(
             "/api/v1/portfolio/accounts",

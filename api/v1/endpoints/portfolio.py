@@ -37,6 +37,7 @@ from api.v1.schemas.portfolio import (
 )
 from src.services.task_queue import get_task_queue
 from src.services.portfolio_import_service import PortfolioImportService
+from src.services.gold_quote_service import is_gold_symbol
 from src.services.portfolio_risk_service import PortfolioRiskService
 from src.services.portfolio_service import (
     PortfolioBusyError,
@@ -501,6 +502,8 @@ def _resolve_position_analysis_context(
     target = service._normalize_symbol_for_position(symbol)
     if not target:
         raise ValueError("symbol must not be empty")
+    if is_gold_symbol(target):
+        raise ValueError("Au99.99 supports portfolio accounting and gold quotes, not stock analysis")
 
     snapshot = service.get_portfolio_snapshot(account_id=account_id, cost_method="fifo")
     matches = []

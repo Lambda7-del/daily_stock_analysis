@@ -7,10 +7,12 @@ Provides DB access helpers for portfolio account/events/snapshot tables.
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import contextmanager
 from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import pandas as pd
 from sqlalchemy import and_, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -727,6 +729,15 @@ class PortfolioRepository:
             if row is None or row.close is None:
                 return None
             return float(row.close), row.date
+
+    def save_gold_history(self, history: List[Dict[str, Any]]) -> None:
+        """Reuse the daily-price cache, under the ledger's canonical gold identity."""
+        from src.services.gold_quote_service import GOLD_LEDGER_SYMBOL, GOLD_SOURCE
+
+        rows = [row for row in history if row.get("close") is not None
+                and math.isfinite(float(row["close"])) and float(row["close"]) > 0]
+        if rows:
+            self.db.save_daily_data(pd.DataFrame(rows), code=GOLD_LEDGER_SYMBOL, data_source=GOLD_SOURCE)
 
     def save_fx_rate(
         self,

@@ -91,6 +91,9 @@ class PortfolioTradeListItem(BaseModel):
     account_id: int
     trade_uid: Optional[str] = None
     symbol: str
+    asset_type: Optional[str] = None
+    quantity_unit: Optional[str] = None
+    price_unit: Optional[str] = None
     market: str
     currency: str
     trade_date: str
@@ -151,6 +154,9 @@ class PortfolioCorporateActionListResponse(BaseModel):
 
 class PortfolioPositionItem(BaseModel):
     symbol: str
+    asset_type: Optional[str] = None
+    quantity_unit: Optional[str] = None
+    price_unit: Optional[str] = None
     market: str
     currency: str
     quantity: float
@@ -287,6 +293,8 @@ class PortfolioDecisionSignalRiskBlock(BaseModel):
 
 
 class PortfolioRiskResponse(BaseModel):
+    data_quality: str = "ok"
+    limitations: List[str] = Field(default_factory=list)
     as_of: str
     account_id: Optional[int] = None
     cost_method: str

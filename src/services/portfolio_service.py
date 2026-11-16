@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -13,6 +14,10 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from data_provider.base import canonical_stock_code, normalize_stock_code
 from src.config import get_config
+from src.services.gold_quote_service import (
+    GOLD_ALIASES, GOLD_LEDGER_SYMBOL, GOLD_SOURCE, GOLD_UNIT,
+    GoldQuoteUnavailableError, get_gold_quote, gold_quote_date, is_gold_symbol,
+)
 from src.repositories.portfolio_repo import (
     DuplicateTradeDedupHashError,
     DuplicateTradeUidError,
@@ -217,6 +222,8 @@ class PortfolioService:
                 account = self._require_active_account_in_session(session=session, account_id=account_id)
                 market_norm = self._normalize_market(market or account.market)
                 currency_norm = self._normalize_currency(currency or self._default_currency_for_market(market_norm))
+                if is_gold_symbol(symbol_norm) and (market_norm != "cn" or currency_norm != "CNY"):
+                    raise ValueError("Au99.99 trades require market=cn, currency=CNY, quantity in grams and price in CNY/g")
                 self._validate_trade_identity(
                     account_id=account_id,
                     trade_uid=trade_uid_norm,
@@ -296,6 +303,8 @@ class PortfolioService:
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
         action_type_norm = (action_type or "").strip().lower()
+        if is_gold_symbol(symbol):
+            raise ValueError("Au99.99 does not support stock dividends or splits")
         if action_type_norm not in VALID_CORPORATE_ACTIONS:
             raise ValueError("action_type must be cash_dividend or split_adjustment")
 
@@ -501,12 +510,14 @@ class PortfolioService:
             "limitations": [],
         }
 
+        gold_prices: Dict[str, _ResolvedPositionPrice] = {}
         for account in account_rows:
             account_snapshot = self._replay_account(
                 account=account,
                 as_of_date=as_of_date,
                 cost_method=method,
                 include_realtime=include_realtime and not read_only,
+                gold_prices=gold_prices,
             )
 
             if not read_only:
@@ -785,6 +796,7 @@ class PortfolioService:
         as_of_date: date,
         cost_method: str,
         include_realtime: bool,
+        gold_prices: Optional[Dict[str, _ResolvedPositionPrice]] = None,
     ) -> Dict[str, Any]:
         trades = self.repo.list_trades(account.id, as_of=as_of_date)
         cash_ledger = self.repo.list_cash_ledger(account.id, as_of=as_of_date)
@@ -945,6 +957,7 @@ class PortfolioService:
             fifo_lots=fifo_lots,
             avg_state=avg_state,
             include_realtime=include_realtime,
+            gold_prices=gold_prices,
         )
         fx_stale = fx_stale or stale_pos
 
@@ -1017,6 +1030,7 @@ class PortfolioService:
         fifo_lots: Dict[Tuple[str, str, str], List[Dict[str, Any]]],
         avg_state: Dict[Tuple[str, str, str], _AvgState],
         include_realtime: bool = True,
+        gold_prices: Optional[Dict[str, _ResolvedPositionPrice]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, float, bool]:
         position_rows: List[Dict[str, Any]] = []
         lot_rows: List[Dict[str, Any]] = []
@@ -1042,7 +1056,7 @@ class PortfolioService:
                     )
                 else:
                     qty = float(avg_state[key].quantity)
-                if qty > EPS:
+                if qty > EPS and not is_gold_symbol(symbol):
                     active_symbols.append(symbol)
         realtime_prices = (
             self._prefetch_realtime_position_prices(active_symbols)
@@ -1080,14 +1094,26 @@ class PortfolioService:
                     }
                 )
 
-            price_info = self._resolve_position_price(
-                symbol=symbol,
-                as_of_date=as_of_date,
-                realtime_prices=realtime_prices,
-                include_realtime=include_realtime,
-            )
-            last_price = price_info.price
             limitations = _portfolio_limitations_for_market(market)
+            if is_gold_symbol(symbol):
+                if market != "cn" or currency != "CNY":
+                    # Do not reinterpret legacy records denominated in another currency.
+                    price_info = _ResolvedPositionPrice(0.0, "missing", None, True, False)
+                    limitations.append("gold_requires_cn_cny")
+                else:
+                    price_info = self._resolve_gold_position_price(
+                        as_of_date=as_of_date, include_realtime=include_realtime, cache=gold_prices,
+                    )
+                if not price_info.is_available:
+                    limitations.append("gold_price_unavailable")
+            else:
+                price_info = self._resolve_position_price(
+                    symbol=symbol,
+                    as_of_date=as_of_date,
+                    realtime_prices=realtime_prices,
+                    include_realtime=include_realtime,
+                )
+            last_price = price_info.price
 
             if price_info.is_available:
                 local_market_value = qty * float(last_price)
@@ -1117,6 +1143,7 @@ class PortfolioService:
             position_rows.append(
                 {
                     "symbol": symbol,
+                    **self._gold_metadata(symbol),
                     "market": market,
                     "currency": currency,
                     "quantity": round(qty, 8),
@@ -1141,6 +1168,49 @@ class PortfolioService:
             total_cost_base += cost_base
 
         return position_rows, lot_rows, market_value_base, total_cost_base, fx_stale
+
+    def _resolve_gold_position_price(
+        self,
+        *,
+        as_of_date: date,
+        include_realtime: bool,
+        cache: Optional[Dict[str, _ResolvedPositionPrice]] = None,
+    ) -> _ResolvedPositionPrice:
+        if cache is not None and GOLD_LEDGER_SYMBOL in cache:
+            return cache[GOLD_LEDGER_SYMBOL]
+
+        quote = None
+        # Match stock snapshot semantics: historical/offline/read-only calls use cached closes.
+        if include_realtime and as_of_date == date.today() and get_config().enable_realtime_quote:
+            try:
+                data = get_gold_quote(days=None)
+            except GoldQuoteUnavailableError as exc:
+                logger.warning("Portfolio gold quote unavailable, using cached close: %s", exc)
+            else:
+                for warning in data["warnings"]:
+                    logger.warning("Portfolio gold: %s", warning)
+                self.repo.save_gold_history(data["history"])
+                quote = data["quote"]
+
+        resolved = self._resolve_position_price(
+            symbol=GOLD_LEDGER_SYMBOL, as_of_date=as_of_date, include_realtime=False,
+        )
+        if quote:
+            quoted_date = gold_quote_date(quote)
+            price = float(quote["price"])
+            if (math.isfinite(price) and price > 0 and quoted_date is not None
+                    and quoted_date <= as_of_date
+                    and (resolved.price_date is None or quoted_date >= resolved.price_date)):
+                resolved = _ResolvedPositionPrice(
+                    price, "realtime_quote", quoted_date, quoted_date < as_of_date, True, GOLD_SOURCE,
+                )
+        if cache is not None:
+            cache[GOLD_LEDGER_SYMBOL] = resolved
+        return resolved
+
+    @staticmethod
+    def _gold_metadata(symbol: str) -> Dict[str, str]:
+        return {"asset_type": "gold", "quantity_unit": "g", "price_unit": GOLD_UNIT} if is_gold_symbol(symbol) else {}
 
     def _resolve_position_price(
         self,
@@ -1257,10 +1327,14 @@ class PortfolioService:
 
     @staticmethod
     def _normalize_symbol_for_storage(symbol: str) -> str:
+        if is_gold_symbol(symbol):
+            return GOLD_LEDGER_SYMBOL
         return canonical_stock_code(symbol)
 
     @staticmethod
     def _normalize_symbol_for_position(symbol: str) -> str:
+        if is_gold_symbol(symbol):
+            return GOLD_LEDGER_SYMBOL
         if not (symbol or "").strip():
             return ""
 
@@ -1284,6 +1358,8 @@ class PortfolioService:
         Keep explicit A-share exchange annotations (SH/SZ/BJ) intact to avoid collapsing
         different exchange variants of the same 6-digit core code.
         """
+        if is_gold_symbol(symbol):
+            return GOLD_LEDGER_SYMBOL
         raw = canonical_stock_code(symbol)
         if not raw:
             return ""
@@ -1301,6 +1377,8 @@ class PortfolioService:
 
     @classmethod
     def _build_symbol_filter_values(cls, symbol: str) -> List[str]:
+        if is_gold_symbol(symbol):
+            return list(GOLD_ALIASES)
         original = (symbol or "").strip().upper()
         normalized = cls._normalize_symbol(original)
         if not normalized:
@@ -1671,7 +1749,8 @@ class PortfolioService:
             "id": int(row.id),
             "account_id": int(row.account_id),
             "trade_uid": row.trade_uid,
-            "symbol": row.symbol,
+            "symbol": GOLD_LEDGER_SYMBOL if is_gold_symbol(row.symbol) else row.symbol,
+            **PortfolioService._gold_metadata(row.symbol),
             "market": row.market,
             "currency": row.currency,
             "trade_date": row.trade_date.isoformat() if row.trade_date else "",
