@@ -55,8 +55,8 @@ class _TempDbTestCase(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
-        os.environ["ENV_FILE"] = str(self.env_path)
-        os.environ["DATABASE_PATH"] = str(self.db_path)
+        self.env_patch = patch.dict(os.environ, {"ENV_FILE": str(self.env_path), "DATABASE_PATH": str(self.db_path)})
+        self.env_patch.start()
         Config.reset_instance()
         DatabaseManager.reset_instance()
         self.db = DatabaseManager.get_instance()
@@ -64,8 +64,7 @@ class _TempDbTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         DatabaseManager.reset_instance()
         Config.reset_instance()
-        os.environ.pop("ENV_FILE", None)
-        os.environ.pop("DATABASE_PATH", None)
+        self.env_patch.stop()
         self.temp_dir.cleanup()
 
     def _create_account(self) -> int:
@@ -424,6 +423,65 @@ class AgentCliAnalysisTest(unittest.TestCase):
         self.assertEqual(code, agent_cli.EXIT_OK, payload)
         self.assertEqual(payload["data"]["report"], "# review")
         self.assertIs(review.call_args.kwargs["send_notification"], False)
+
+
+class AgentCliWatchlistTest(_TempDbTestCase):
+    def test_watchlist_round_trip_and_conflict(self) -> None:
+        code, payload = _run(["watchlist", "list"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        stale_version = payload["data"]["version"]
+        code, payload = _run(["watchlist", "add", "Au99.99"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        self.assertEqual(payload["data"]["gold_codes"], ["AU9999"])
+        self.assertEqual(payload["data"]["stock_codes"], ["600519"])
+        review = {"run_id": "cli-round", "version": stale_version, "decisions": [
+            {"symbol": "AAPL", "action": "add", "evaluation": "complete", "reason": "已验证事件关联",
+             "evidence": ["https://example.com/announcement"]},
+        ]}
+        review_file = Path(self.temp_dir.name) / "review.json"
+        review_file.write_text(json.dumps(review), encoding="utf-8")
+        code, failed = _run(["watchlist", "apply", "--file", str(review_file)])
+        self.assertEqual(code, agent_cli.EXIT_USAGE_ERROR)
+        self.assertEqual(failed["error"]["type"], "watchlist_conflict")
+        review["version"] = payload["data"]["version"]
+        review_file.write_text(json.dumps(review), encoding="utf-8")
+        code, payload = _run(["watchlist", "apply", "--file", str(review_file)])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        self.assertIn("AAPL", payload["data"]["stock_codes"])
+        code, payload = _run(["watchlist", "apply", "--file", str(review_file)])
+        self.assertTrue(payload["data"]["already_recorded"])
+        code, payload = _run(["watchlist", "history"])
+        self.assertEqual(len(payload["data"]["items"]), 2)
+
+    def test_news_reports_source_failures_and_reads_existing_items(self) -> None:
+        from datetime import datetime
+        from src.repositories.intelligence_repo import IntelligenceRepository
+
+        IntelligenceRepository(self.db).upsert_items([{
+            "title": "公告", "url": "https://example.com/news", "source_name": "fixture",
+            "source_type": "rss", "scope_type": "market", "market": "cn", "published_at": datetime.now(),
+        }])
+        failure = {"source_count": 1, "results": [{"ok": False, "source_id": 1, "error": "timeout"}]}
+        with patch("src.services.intelligence_service.IntelligenceService.fetch_enabled_sources", return_value=failure):
+            code, payload = _run(["news", "--refresh", "--market", "cn"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        self.assertEqual(payload["data"]["items"][0]["title"], "公告")
+        self.assertFalse(payload["data"]["refresh"]["results"][0]["ok"])
+        code, payload = _run(["news", "--days", "0"])
+        self.assertEqual(code, agent_cli.EXIT_USAGE_ERROR)
+
+    def test_data_only_market_review_never_constructs_analysis_pipeline(self) -> None:
+        from src.market_analyzer import MarketOverview
+
+        with patch("src.services.analyzer_service.StockAnalysisPipeline", side_effect=AssertionError("nested model")), \
+                patch("src.market_analyzer.DataFetcherManager"), \
+                patch("src.market_analyzer.MarketAnalyzer.get_market_overview", return_value=MarketOverview(date="2026-11-16")), \
+                patch("src.market_analyzer.MarketAnalyzer.build_market_light_snapshot", return_value=None), \
+                patch("src.market_analyzer.MarketAnalyzer.generate_market_review", side_effect=AssertionError("LLM")):
+            code, payload = _run(["market-review", "--data-only", "--region", "us"])
+        self.assertEqual(code, agent_cli.EXIT_OK, payload)
+        self.assertEqual(payload["data"]["region"], "us")
+        self.assertEqual(payload["data"]["markdown_report"], "")
 
 
 class AgentCliGoldTest(unittest.TestCase):

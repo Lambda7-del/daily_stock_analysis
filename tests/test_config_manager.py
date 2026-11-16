@@ -5,10 +5,12 @@ import errno
 import os
 import tempfile
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from src.core.config_manager import ConfigManager
+from src.core.config_manager import ConfigManager, ConfigVersionConflictError
 
 
 class ConfigManagerTestCase(unittest.TestCase):
@@ -21,6 +23,26 @@ class ConfigManagerTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.pop("ENV_FILE", None)
         self.temp_dir.cleanup()
+
+    def test_concurrent_managers_check_version_under_the_write_lock(self) -> None:
+        self.env_path.write_text("STOCK_LIST=600519\n", encoding="utf-8")
+        version = self.manager.get_config_version()
+        ready = threading.Barrier(2)
+
+        def update(code):
+            manager = ConfigManager(self.env_path)
+            ready.wait(timeout=5)
+            try:
+                manager.apply_updates(updates=[("STOCK_LIST", code)], sensitive_keys=set(),
+                                      mask_token="******", expected_version=version)
+                return "saved"
+            except ConfigVersionConflictError:
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(update, ["AAPL", "MSFT"]))
+        self.assertCountEqual(results, ["saved", "conflict"])
+        self.assertIn(self.manager.read_config_map()["STOCK_LIST"], ["AAPL", "MSFT"])
 
     def test_apply_updates_preserves_comments_blank_lines_and_raw_lines(self) -> None:
         self.env_path.write_text(

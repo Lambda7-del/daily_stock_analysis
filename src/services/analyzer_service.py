@@ -98,6 +98,15 @@ def analyze_stocks(
     return results
 
 
+def get_market_review_context(region: str = "cn", config: Config = None) -> dict:
+    """Return market data for external-agent reasoning without constructing an LLM."""
+    from src.market_analyzer import MarketAnalyzer
+
+    market = MarketAnalyzer(region=region, config=config or get_config())
+    overview = market.get_market_overview()
+    return market.build_market_review_payload(overview, news=[], report="")
+
+
 def perform_market_review(
     config: Config = None,
     notifier: Optional[NotificationService] = None,

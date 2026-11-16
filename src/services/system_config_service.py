@@ -459,6 +459,7 @@ class SystemConfigService:
 
     def get_config(self, include_schema: bool = True, mask_token: str = "******") -> Dict[str, Any]:
         """Return display config values with mask metadata for server-masked fields."""
+        config_version = self._manager.get_config_version()
         saved_config_map = self._build_display_config_map(self._manager.read_config_map())
         runtime_config_map = self._build_runtime_display_config_map(saved_config_map)
         config_map = {
@@ -509,7 +510,7 @@ class SystemConfigService:
         )
 
         return {
-            "config_version": self._manager.get_config_version(),
+            "config_version": config_version,
             "mask_token": mask_token,
             "items": items,
             "llm_model_providers": sorted(get_litellm_model_providers()),
@@ -2087,11 +2088,17 @@ class SystemConfigService:
             if bool(field_schema.get("is_sensitive", False)):
                 sensitive_keys.add(key)
 
-        updated_keys, skipped_masked_keys, new_version = self._manager.apply_updates(
-            updates=updates,
-            sensitive_keys=sensitive_keys,
-            mask_token=mask_token,
-        )
+        from src.core.config_manager import ConfigVersionConflictError
+
+        try:
+            updated_keys, skipped_masked_keys, new_version = self._manager.apply_updates(
+                updates=updates,
+                sensitive_keys=sensitive_keys,
+                mask_token=mask_token,
+                expected_version=config_version,
+            )
+        except ConfigVersionConflictError as exc:
+            raise ConfigConflictError(current_version=exc.current_version) from exc
 
         warnings: List[str] = []
         reload_triggered = False

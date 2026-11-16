@@ -1,13 +1,13 @@
 ---
 name: daily-stock-analysis-cli
-description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：由 DSA 取数并组装分析上下文，你自己完成个股分析后交回 DSA 入库，再做持仓快照与风险检查，并在用户确认成交后记账。支持上金所 Au99.99 黄金行情（元/克）及按克记账。当用户要求分析股票、做每日复盘、查看或调整股票与黄金持仓、查询国内金价时使用。
+description: 通过本机 DSA Agent CLI 分析股票与黄金、从新闻发现候选并维护关注、复盘持仓和检查风险，在用户确认实际成交后记账。用于每日复盘、关注管理、股票分析及黄金行情和账本查询。
 ---
 
 # daily_stock_analysis Agent CLI
 
 本 Skill 供 ChatGPT dot 等在自有电脑上运行的 Agent 使用。DSA 已安装在本机，通过命令行调用，不经 HTTP。
 
-分工：**DSA 负责数据、指标、提示词、解析、风控兜底和入库，你负责分析本身。** DSA 不需要配置任何模型或搜索 key，也不会替你调用模型。
+分工：**DSA 负责数据、指标、提示词、解析、风控兜底和入库，你负责分析本身。** 使用下述数据接口和 `context` → `analyze --responses` 时不调用 DSA 模型。未配置新闻源或搜索 key 时，由你联网补充证据。
 
 ## 运行约定
 
@@ -26,7 +26,12 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 | --- | --- |
 | 取数并生成分析提示词（不调用模型） | `context --stocks 600519,hk00700,AAPL [--handoff-dir DIR]` |
 | 提交你写好的分析并入库、生成报告 | `analyze --stocks <同上> --responses <handoff_dir> [--model-label dot]` |
-| 大盘复盘数据（不推送通知） | `market-review` |
+| 大盘结构化行情（不调用模型） | `market-review --data-only [--region cn]` |
+| 新闻情报（可刷新已启用源） | `news [--refresh] [--market cn] [--days 3] [--page 1]` |
+| 关注列表、移除记录和版本 | `watchlist list` |
+| 用户明确要求添加 / 移除关注 | `watchlist add AAPL [--reason 理由]` / `watchlist remove AAPL` |
+| 保存候选复查并自动维护关注 | `watchlist apply --file review.json` |
+| 上轮候选、证据和关注变化 | `watchlist history [--limit 20]` |
 | 上金所 Au99.99 黄金行情（元/克，只取数不分析） | `gold [--days 30] [--no-realtime]` |
 | 列出持仓账户 | `portfolio accounts` |
 | 持仓快照与盈亏 | `portfolio snapshot [--account-id N] [--no-realtime]` |
@@ -62,12 +67,40 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 
 ## 每日例行流程
 
-1. `market-review`，基于其中的数据给出你自己的大盘判断（未配置模型时 DSA 返回数据模板报告）。
-2. `portfolio snapshot` 取出持仓；把 `asset_type=gold` 或代码为 `AU9999` / `AU99.99` 的黄金单独取出，其余代码与用户自选股合并去重；保留每个持仓的 `quantity`、单位、`avg_cost`、`unrealized_pnl_pct`、`market_value_base` 及价格可用性，供第 5 步使用。自选列表中的黄金也按同一规则分流。
-3. 股票 / ETF 按上面的交接流程完成个股分析（多于 5 只时分批）；黄金单独调用 `gold`，结合按克持仓自行分析，不进入 `context` / `analyze`。
-4. `portfolio risk`，关注集中度、回撤、止损告警。
-5. 汇总发给用户：大盘一句话结论；每个持仓的建议动作、关键点位和理由；风险告警；新机会（自选股中非持仓且建议买入的）。明确标注这些是建议，不是已执行的操作。
-   - DSA 报告里的仓位建议是通用的，不知道用户的成本和仓位。汇总持仓时，由你结合第 2 步的真实数据给出针对性建议：例如浮盈较大时止损位是否上移保护利润、被套时止损位离成本有多远、单只占比过高时是否先控仓（集中度以 `portfolio risk` 为准）。说明哪些结论来自 DSA 报告、哪些是你结合持仓做的调整。
+1. `watchlist list`、`watchlist history` 和 `portfolio snapshot`，读取当前关注、上轮待验证候选及持仓，保留关注的 `version`。持仓保留数量、单位、成本、浮盈、市值和价格可用性。
+2. `market-review --data-only` 获取相关市场行情；`news --refresh` 获取新闻，核对 `published_at`、来源和刷新失败项。`days` 是抓取时间窗口，不代表旧新闻重新发布。没有配置源、新闻不足或刷新失败时，用自己的联网能力补查公告、行业和宏观新闻；记录链接及事件时间，查不到则明确缺失。
+3. **先分析新闻，再产生临时候选**：说明事件如何影响公司，核实代码与公司对应关系，排除重复旧消息和缺乏关联依据的标的。候选不是正式关注，不因出现一条新闻就立即添加。
+4. 合并“持仓 ∪ 现有关注 ∪ 本轮候选”，去重后深入验证行情、公司新闻及风险。股票 / ETF 走 `context` → 自己分析 → `analyze --responses`（每批不超过 5 只）；黄金通过 `gold` 单独分析。即使没有新候选，也要继续跟踪持仓与现有关注。
+5. `portfolio risk` 检查集中度、回撤与止损；结合真实持仓给出个性化判断，区分 DSA 通用结论与自己的持仓调整。
+6. 写出下面格式的复查 JSON。只有完成验证的对象才标记 `complete`；缺数据或分析失败记为 `incomplete`。关注价值与立即买入不同：可以关注有催化但尚未满足买入条件的标的。移除应说明原关注理由为何失效，不能因今天没有新闻或一次获取失败而移除。
+7. 用户已授权自动维护关注时，执行 `watchlist apply`；普通分析请求只报告拟议变化。`watchlist_conflict` / `config_conflict` 时重新读取、复核，使用新 `run_id`，不能仅替换版本盲目重试。同一请求重试复用原文件和 `run_id`，`already_recorded=true` 表示已经提交；返回的是原轮结果，继续操作前重新读取列表。
+8. 汇总市场判断、持仓建议、风险、新关注与移除理由、待验证候选和未覆盖项。关注变化不是成交，不据此记账。
+
+## 候选与关注复查格式
+
+```json
+{
+  "run_id": "daily-20261116-1",
+  "version": "替换为本轮 watchlist list 返回的 version",
+  "news_summary": "已核对事件时间和来源；记录缺失的数据及覆盖范围",
+  "decisions": [
+    {
+      "symbol": "AAPL",
+      "action": "add",
+      "evaluation": "complete",
+      "reason": "替换为事件关联依据、验证结论及等待条件",
+      "evidence": ["https://example.com/replace-with-real-source"],
+      "review_after": "2026-11-20"
+    }
+  ]
+}
+```
+
+- `action`：`add` 加入关注、`keep` 更新自动关注理由、`remove` 移除自动关注、`reject` 否决候选、`defer` 留待验证。`reject/defer` 只记录，不改变列表；遗漏的标的不变。`review_after` 可省略，是下次复查日期，不会到期自动删除。
+- `evaluation=incomplete` 的决定只留记录、不改变关注；新增自动关注必须带真实来源链接。候选结论与外部新闻证据保存在复查历史中。
+- 手动添加（包括 Web 添加）默认受保护；手动移除后禁止自动重新添加，直到用户明确重新添加。`watchlist add/remove` 仅用于执行用户明确指令，不用于绕过自动维护限制。
+- 自动关注默认最多 20 个，自动移除后 3 天内不重新添加；可按用户约定传入 `--max-auto-items` / `--cooldown-days`。检查返回 `changes[].applied` 及未应用原因，不把跳过项报告成成功。
+- `watchlist add Au99.99` 可关注未买入的黄金；`gold_codes` 和黄金持仓都走 `gold`，不传给股票分析。现有 Web 自选页面仍只展示股票。
 
 ## 硬规则
 
@@ -77,4 +110,4 @@ description: 在本机终端调用 daily_stock_analysis（DSA）的 Agent CLI：
 - 返回 `portfolio_oversell`、`validation_error` 时如实告诉用户，不要自行改数量或价格。
 - `cash-add` 没有去重，执行前先用 `portfolio snapshot` 核对现金，避免重复记录。
 - 返回 `agent_pipeline_unsupported` 时，说明 DSA 开启了 `AGENT_MODE` 或 `AGENT_SKILLS`，请用户关闭后再用交接流程，不要自行修改 `.env`。
-- 不修改、不删除 DSA 的数据库和 `.env`，不尝试代替用户下单。
+- 不直接修改、删除 DSA 的数据库和 `.env`；通过上述 CLI 管理关注和记账，不尝试代替用户下单。

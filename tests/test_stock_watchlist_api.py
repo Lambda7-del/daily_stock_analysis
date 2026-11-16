@@ -12,6 +12,20 @@ from api.v1.schemas.history import WatchlistRequest
 from src.config import Config, setup_env
 from src.core.config_manager import ConfigManager
 from src.services.system_config_service import SystemConfigService
+from src.storage import DatabaseManager
+
+
+@pytest.fixture(autouse=True)
+def isolated_watchlist_journal(tmp_path):
+    env_path = tmp_path / "journal.env"
+    env_path.write_text("STOCK_LIST=\n", encoding="utf-8")
+    with patch.dict(os.environ, {"ENV_FILE": str(env_path), "DATABASE_PATH": str(tmp_path / "watchlist.db")}):
+        Config.reset_instance()
+        DatabaseManager.reset_instance()
+        DatabaseManager.get_instance()
+        yield
+        DatabaseManager.reset_instance()
+        Config.reset_instance()
 
 
 class FakeSystemConfigService:
@@ -26,10 +40,11 @@ class FakeSystemConfigService:
             "items": [{"key": "STOCK_LIST", "value": self.stock_list}],
         }
 
-    def update(self, **kwargs) -> None:
+    def update(self, **kwargs) -> dict:
         items = kwargs["items"]
         self.stock_list = items[0]["value"]
         self.update_calls.append(self.stock_list)
+        return {"config_version": self.config_version}
 
 
 def test_watchlist_add_deduplicates_raw_hk_code_against_prefixed_variant() -> None:

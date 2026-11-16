@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,12 @@ _ESCAPED_APPLICATION_TEMPLATE_PLACEHOLDER_PATTERN = re.compile(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigVersionConflictError(ValueError):
+    def __init__(self, current_version: str):
+        super().__init__("Configuration version conflict")
+        self.current_version = current_version
 
 
 def escape_compose_sensitive_env_value(key: str, value: str) -> str:
@@ -179,9 +186,14 @@ class ConfigManager:
         updates: Iterable[Tuple[str, str]],
         sensitive_keys: Set[str],
         mask_token: str,
+        expected_version: Optional[str] = None,
     ) -> Tuple[List[str], List[str], str]:
         """Apply updates into `.env` file using atomic replace when possible."""
-        with self._lock:
+        with self._lock, self._file_write_lock():
+            if expected_version is not None:
+                current_version = self.get_config_version()
+                if current_version != expected_version:
+                    raise ConfigVersionConflictError(current_version)
             current_values = self.read_config_map()
             stored_values = self._read_config_map(normalize_values=False)
             mutable_updates: Dict[str, str] = {}
@@ -213,6 +225,30 @@ class ConfigManager:
                 self._atomic_upsert(mutable_updates)
 
             return list(mutable_updates.keys()), skipped_masked, self.get_config_version()
+
+    @contextmanager
+    def _file_write_lock(self):
+        """Serialize CLI and Web writers across processes before checking the version."""
+        self._env_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._env_path.with_name(self._env_path.name + ".lock").open("a+b") as handle:
+            if os.name == "nt":  # pragma: no cover - Windows packaging
+                import msvcrt
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":  # pragma: no cover
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _atomic_upsert(self, updates: Dict[str, str]) -> None:
         """Write updates with atomic rename and in-place fallback for mounted files."""

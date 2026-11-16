@@ -13,7 +13,6 @@
 
 import logging
 from typing import Optional
-import re
 
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile, Depends
 
@@ -42,9 +41,8 @@ from src.services.import_parser import (
 from src.services.stock_service import StockService
 from src.services.stock_profile_service import InvalidStockProfileCode, StockProfileService
 from src.services.run_diagnostics import sanitize_diagnostic_text
-from src.services.stock_list_parser import split_stock_list
-from src.services.system_config_service import SystemConfigService
-from data_provider.base import normalize_stock_code
+from src.services.system_config_service import ConfigConflictError, SystemConfigService
+from src.services.watchlist_service import WatchlistService, validate_watchlist_code
 
 logger = logging.getLogger(__name__)
 
@@ -54,74 +52,11 @@ router = APIRouter()
 ALLOWED_MIME_STR = ", ".join(ALLOWED_MIME)
 
 
-def _read_watchlist_codes(service: SystemConfigService) -> list:
-    """Read STOCK_LIST codes as-is (no normalization)."""
-    config_data = service.get_config(include_schema=False)
-    stock_list_str = ""
-    for item in config_data.get("items", []):
-        if item.get("key") == "STOCK_LIST":
-            stock_list_str = str(item.get("value", ""))
-            break
-    return split_stock_list(stock_list_str)
-
-
-def _write_watchlist_codes(service: SystemConfigService, codes: list) -> None:
-    """Persist stock codes to STOCK_LIST as-is (no normalization)."""
-    config_data = service.get_config(include_schema=False)
-    config_version = config_data.get("config_version", "")
-    service.update(
-        config_version=config_version,
-        items=[{"key": "STOCK_LIST", "value": ",".join(codes)}],
-        mask_token="******",
-        reload_now=True,
-    )
-
-
-# Stock code validation patterns (aligned with frontend validateStockCode)
-_STOCK_CODE_RE = re.compile(
-    r"^(?:\d{6}"                              # A-share 6-digit
-    r"|(?:SH|SZ|BJ)\d{6}"                     # exchange-prefixed A-share
-    r"|\d{6}\.(?:SH|SZ|SS|BJ)"                # exchange-suffixed A-share
-    r"|\d{1,5}\.HK"                           # HK suffix format
-    r"|HK\d{1,5}"                             # HK prefix format
-    r"|\d{5}"                                 # bare 5-digit HK code
-    r"|\d{4,5}\.T"                            # Japan Yahoo suffix format
-    r"|\d{6}\.(?:KS|KQ)"                     # Korea Yahoo suffix format
-    r"|\d{4,6}\.(?:TW|TWO)"                  # Taiwan Yahoo suffix format
-    r"|[A-Z]{1,5}(?:\.(?:US|[A-Z]))?"         # US ticker
-    r")$",
-    re.IGNORECASE,
-)
-
-
 def _validate_and_normalize_stock_code(code: str) -> str:
-    """Validate stock code format and return canonical form.
-
-    Raises HTTPException(400) if the code does not match supported formats.
-    """
-    stripped = code.strip()
-    if not stripped:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "invalid_stock_code", "message": "股票代码不能为空"},
-        )
-    if not _STOCK_CODE_RE.match(stripped):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "error": "invalid_stock_code",
-                "message": f"'{stripped}' 不是合法的股票代码格式",
-            },
-        )
-    return normalize_stock_code(stripped)
-
-
-def _watchlist_match_key(code: str) -> str:
-    """Return the equivalence key used for watchlist add/remove matching."""
-    normalized = normalize_stock_code(code.strip())
-    if re.fullmatch(r"\d{5}", normalized):
-        return f"HK{normalized}"
-    return normalized.upper()
+    try:
+        return validate_watchlist_code(code, allow_gold=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "invalid_stock_code", "message": str(exc)}) from exc
 
 
 @router.post(
@@ -333,7 +268,7 @@ def get_watchlist(
     service: SystemConfigService = Depends(get_system_config_service),
 ) -> WatchlistResponse:
     try:
-        codes = _read_watchlist_codes(service)
+        codes = WatchlistService(config_service=service).list()["stock_codes"]
         return WatchlistResponse(stock_codes=codes, message=f"当前自选 {len(codes)} 只股票")
     except Exception as e:
         logger.error(f"获取自选队列失败: {e}", exc_info=True)
@@ -359,15 +294,13 @@ def add_to_watchlist(
     service: SystemConfigService = Depends(get_system_config_service),
 ) -> WatchlistResponse:
     try:
-        validated = _validate_and_normalize_stock_code(request.stock_code)
-        codes = _read_watchlist_codes(service)
-        existing_keys = [_watchlist_match_key(c) for c in codes]
-        if _watchlist_match_key(validated) not in existing_keys:
-            codes.append(request.stock_code.strip())
-            _write_watchlist_codes(service, codes)
+        _validate_and_normalize_stock_code(request.stock_code)
+        codes = WatchlistService(config_service=service).change(request.stock_code, action="add")["stock_codes"]
         return WatchlistResponse(stock_codes=codes, message=f"已加入 {request.stock_code.strip()}")
     except HTTPException:
         raise
+    except ConfigConflictError as exc:
+        raise HTTPException(status_code=409, detail={"error": "config_conflict", "message": str(exc)}) from exc
     except Exception as e:
         logger.error(f"加入自选失败: {e}", exc_info=True)
         raise HTTPException(
@@ -392,17 +325,13 @@ def remove_from_watchlist(
     service: SystemConfigService = Depends(get_system_config_service),
 ) -> WatchlistResponse:
     try:
-        validated = _validate_and_normalize_stock_code(request.stock_code)
-        codes = _read_watchlist_codes(service)
-        existing_keys = [_watchlist_match_key(c) for c in codes]
-        requested_key = _watchlist_match_key(validated)
-        if requested_key in existing_keys:
-            idx = existing_keys.index(requested_key)
-            codes.pop(idx)
-            _write_watchlist_codes(service, codes)
+        _validate_and_normalize_stock_code(request.stock_code)
+        codes = WatchlistService(config_service=service).change(request.stock_code, action="remove")["stock_codes"]
         return WatchlistResponse(stock_codes=codes, message=f"已移除 {request.stock_code.strip()}")
     except HTTPException:
         raise
+    except ConfigConflictError as exc:
+        raise HTTPException(status_code=409, detail={"error": "config_conflict", "message": str(exc)}) from exc
     except Exception as e:
         logger.error(f"从自选删除失败: {e}", exc_info=True)
         raise HTTPException(

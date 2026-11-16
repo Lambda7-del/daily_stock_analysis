@@ -6,16 +6,37 @@
 
 ## 能力边界
 
-- Agent CLI 只包装现有服务：个股分析、大盘复盘、持仓账本（账户 / 成交 / 资金）、持仓快照与风险报告、决策信号查询，以及上海黄金交易所 Au99.99 行情（`gold`）。不新增数据库表、配置项或 HTTP 接口。
+- Agent CLI 复用个股分析、大盘复盘、新闻情报、持仓账本、风险和黄金行情服务，并提供关注管理与候选复查接口。股票关注继续使用 `STOCK_LIST`，Web 与 CLI 共用关注服务；在现有数据库中追加 `watchlist_reviews` 表保存来源、黄金关注、候选结论和变更历史，不新增环境配置项。
 - `gold` 只返回行情数据（元/克），不做分析：黄金现货不进入个股分析流水线，`analyze` / `context` 不支持 `AU9999`、`Au99.99` 这类代码（会被当作 A 股代码而取数失败）。需要黄金 ETF 的技术面分析时，对 `518880` 等 ETF 代码使用 `context` 即可，但其价格是基金份额价格而非元/克。
 - 推荐由 dot 自己充当分析模型：`context` 让 DSA 取数并生成与正常分析完全相同的提示词（不调用模型），dot 写出 JSON 结果后用 `analyze --responses` 交回，DSA 按标准流程解析、风控兜底、写入历史与决策信号。这样 DSA 不需要任何模型或搜索 key，也避免 "dot → DSA → 另一个模型" 的嵌套调用。
 - 个股分析提示词不含持仓数量、成本与浮盈，与 `python main.py` 每日分析一致，报告中的仓位建议是"空仓者 / 持仓者"两套通用建议。结合真实持仓的建议由 dot 在每日汇总时基于 `portfolio snapshot` / `portfolio risk` 给出，见 Skill 示例。
 - 持仓账本只记录**已确认的成交**，DSA 不对接券商下单。持仓写操作必须带 `--confirmed`，成交必须带 `--trade-uid` 以便重试去重。
 - 持仓账本支持上金所 Au99.99 黄金：代码 `AU9999` / `Au99.99` 等价，数量以克、价格以元/克记录，市场使用 `cn`、币种使用 `CNY`。黄金 ETF 仍按基金份额记账，两者不合并。
-- `market-review` 默认不推送通知，结果由 Agent 自己转达；个股分析同样不推送。需要 DSA 自带的通知渠道时，仍可用 `python main.py`。
+- dot 使用 `market-review --data-only [--region cn|hk|us|jp|kr]` 获取结构化市场行情，不调用模型；新闻由 `news` 或 dot 联网取得。原 `market-review` 保持生成报告的行为，配置模型时可能调用该模型；两种模式都不推送通知。
 - Agent 工具调用（问股 Agent）、图片识别不在本入口范围内。
 
 命令、输出格式和硬规则见 Skill 示例：[`docs/examples/codex_dot/SKILL.md`](examples/codex_dot/SKILL.md)。
+
+## 关注与新闻驱动候选
+
+日常顺序为：读取关注和持仓 → 分析新闻与市场事件 → 产生临时候选 → 合并持仓、关注和候选进行深入验证 → 检查组合风险 → 提交关注变更 → 汇总日报。没有新候选或新闻源失败时，仍需检查已有持仓与关注。
+
+```bash
+$DSA_PY -m src.agent_cli watchlist list
+$DSA_PY -m src.agent_cli news --refresh --days 3
+$DSA_PY -m src.agent_cli market-review --data-only --region cn
+$DSA_PY -m src.agent_cli watchlist add AAPL --reason "用户要求持续跟踪"
+$DSA_PY -m src.agent_cli watchlist add Au99.99
+$DSA_PY -m src.agent_cli watchlist apply --file review.json
+$DSA_PY -m src.agent_cli watchlist history --limit 20
+```
+
+- `news` 读取现有情报条目，支持 `--market`、`--days`、`--page`、`--page-size`。`--refresh` 只刷新已启用源，不创建或启用源；查看 `refresh.source_count` 和各项 `refresh.results[].ok`，整体命令成功不代表每个源都成功。`days` 按抓取时间筛选，仍需核对发布时间；无来源或数据不足时由 dot 联网补充。配置入口沿用 [新闻情报源](intelligence-sources.md)。
+- `watchlist list` 返回股票 `stock_codes`、黄金 `gold_codes`、活动 `items`、已移除 `inactive` 和版本 `version`。旧自选默认视为手动关注。黄金关注仅存于数据库，不加入股票分析任务使用的 `STOCK_LIST`；旧 Web 页面仍只展示股票，黄金通过 CLI 管理。
+- `watchlist add/remove <代码>` 执行用户明确要求的变化。手动添加受保护；手动移除留下阻止自动重新添加的记录，直到用户再次手动添加。Web 的添加/移除也遵循同一语义。
+- `watchlist apply` 的 JSON 契约见 Skill 的“候选与关注复查格式”。`run_id` 用于去重，`version` 用于防止旧分析覆盖新关注；同一 `run_id` 不允许提交不同内容。重试返回原轮结果，后续操作应重新读取列表。所有决定先校验，再执行；`evaluation=incomplete`、`reject/defer` 仅记录，不改变关注。默认最多 20 个自动关注、自动移除后 3 天内不重新添加，可通过 `--max-auto-items` / `--cooldown-days` 指定策略。
+- dot 判断事件关联、代码身份、关注价值与移除理由；代码校验输入格式、版本、手动保护、证据链接及明确的验证状态。`review_after` 是复查提示，不是自动删除日期。外部新闻摘要、链接、候选及验证结果随轮次保存，不另建候选管理平台，也不会生成交易。
+- 配置写入带版本校验和进程间锁。关注记录与 `.env` 为两个存储：异常中断后，以 `.env` 的股票成员为准；缺少记录的新增股票保守视为手动关注，外部移除视为手动移除。若命令报错，重新读取列表和历史确认结果，不盲目重试自动变更。
 
 ## 黄金记账与估值
 
@@ -72,7 +93,7 @@ LOG_DIR=/home/<user>/dsa-data/logs
 
 ### 2. 模型
 
-- **推荐：不在 DSA 配置模型**，由 dot 通过 `context` → `analyze --responses` 完成分析（见 Skill 示例）。`.env` 中不设置任何 LLM Key / `GENERATION_BACKEND` 即可；大盘复盘会返回基于数据的模板报告，由 dot 自行解读。交接模式要求 `AGENT_MODE` 关闭且 `AGENT_SKILLS` 为空，否则返回 `agent_pipeline_unsupported`。交接文件默认写在 `reports/agent_handoff/<时间戳>/`，可定期清理。
+- **推荐：不在 DSA 配置模型**，由 dot 通过 `context` → `analyze --responses` 完成分析（见 Skill 示例）。`.env` 中不设置任何 LLM Key / `GENERATION_BACKEND` 即可；大盘使用 `market-review --data-only`，由 dot 自行解读。交接模式要求 `AGENT_MODE` 关闭且 `AGENT_SKILLS` 为空，否则返回 `agent_pipeline_unsupported`。交接文件默认写在 `reports/agent_handoff/<时间戳>/`，可定期清理。
 
 如果希望 DSA 自己生成分析（`analyze` 不带 `--responses`），二选一：
 
@@ -102,7 +123,7 @@ $PY -m src.agent_cli context --stocks 600519
 
 1. 把 [`docs/examples/codex_dot/SKILL.md`](examples/codex_dot/SKILL.md) 作为 dot 的 Skill，并告诉它 `$DSA_HOME` 与 `$DSA_PY` 的实际路径。
 2. 首次让 dot 在你确认后创建持仓账户，并录入当前持仓（逐笔 `trade-add`，或在 Web 端用 CSV 导入后再交给 dot 维护）。
-3. 创建定时任务，例如"工作日 18:00（Asia/Shanghai）按 Skill 的每日例行流程执行，把汇总发给我；不要在未经我确认时记录任何成交"，并让 dot 复述保存的计划。
+3. 创建定时任务，例如"工作日 18:00（Asia/Shanghai）按 Skill 的每日例行流程执行，允许维护自动关注，把汇总发给我；保留手动关注，不要在未经我确认时记录任何成交"，并让 dot 复述保存的计划。定时触发仍由 dot 负责。
 
 ## 运行注意
 
@@ -114,4 +135,4 @@ $PY -m src.agent_cli context --stocks 600519
 
 ## 回滚
 
-Agent CLI 不引入数据迁移。停用 dot 定时任务即可停止调用；持仓数据仍在 `DATABASE_PATH` 中，可继续通过 Web 端或 API 使用。回退黄金兼容代码也不需要删除流水或缓存，但旧版本不再合并黄金别名或获取金价，黄金估值和风险结果不应继续使用。
+停用 dot 定时任务即可停止自动维护；回退代码无需删除追加的 `watchlist_reviews` 表。股票关注仍保留在 `STOCK_LIST`，旧 Web/API 可以继续使用，但旧版不读取黄金关注、保护标记及候选历史；回退代码不会撤销已经执行的关注变化，可按历史记录手动恢复。持仓数据不受关注功能影响。回退黄金记账兼容代码也不需要删除流水或缓存，但旧版本的黄金估值和风险结果不应继续使用。

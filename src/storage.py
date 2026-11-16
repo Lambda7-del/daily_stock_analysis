@@ -311,6 +311,18 @@ class FundamentalSnapshot(Base):
         return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
+class WatchlistReview(Base):
+    """Watchlist snapshots and candidate decisions; trades remain in the ledger."""
+
+    __tablename__ = 'watchlist_reviews'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, unique=True, index=True)
+    request_json = Column(Text, nullable=False)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now, nullable=False)
+
+
 class ScreeningRun(Base):
     """A completed built-in screening run persisted by DSA."""
 

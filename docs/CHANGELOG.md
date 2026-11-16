@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [新功能] dot CLI 新增关注列表、候选复查与变更历史，复用 Web 自选并保护手动关注，支持黄金独立关注、版本冲突检测和重复提交去重；新增新闻读取及无模型大盘数据入口，Skill 按新闻发现候选、验证后维护关注。
 - [新功能] 持仓账本兼容上金所 Au99.99 黄金，统一 `Au99.99` / `AU9999` 别名，按克和元/克记账；接入金价与日线缓存、历史估值和缺价标记，风险报告区分黄金与股票信号，补充 CLI/API 单位字段及 dot 黄金流程。
 - [新功能] 新增面向外部 Agent（如 ChatGPT dot）的 JSON 命令行入口 `python -m src.agent_cli`，覆盖个股分析、大盘复盘、持仓账本、持仓风险与决策信号查询；持仓写操作需显式确认，成交按 `trade_uid` 去重，附 dot 部署文档与 Skill 示例。
 - [改进] 本地 CLI 生成后端失败时保留脱敏后的 stderr 尾部（`stderr_tail_preview`），网络连接失败归类为 `network_unreachable` 而非被会话横幅误判为 `approval_required`；`agent_cli analyze` 全部失败时在 `error.details.results[].error_details` 返回后端诊断。

@@ -282,12 +282,42 @@ def _cmd_analyze(args: argparse.Namespace) -> Dict[str, Any]:
 
 def _cmd_market_review(args: argparse.Namespace) -> Dict[str, Any]:
     from src.config import get_config
-    from src.services.analyzer_service import perform_market_review
+    from src.services.analyzer_service import get_market_review_context, perform_market_review
 
+    if args.data_only:
+        return get_market_review_context(region=args.region, config=get_config())
     report = perform_market_review(config=get_config(), send_notification=False)
     if not report:
         raise AgentCliError("market_review_failed", "大盘复盘未产出报告", exit_code=EXIT_RUNTIME_ERROR)
     return {"report": report}
+
+
+def _cmd_news(args: argparse.Namespace) -> Dict[str, Any]:
+    from src.services.intelligence_service import IntelligenceService
+
+    if args.days < 1 or args.page < 1 or not 1 <= args.page_size <= 100:
+        raise AgentCliError("validation_error", "days/page 必须为正数，page-size 必须为 1-100")
+    service = IntelligenceService()
+    refresh = service.fetch_enabled_sources() if args.refresh else None
+    return {**service.list_items(market=args.market, days=args.days, page=args.page, page_size=args.page_size),
+            "refresh": refresh}
+
+
+def _cmd_watchlist(args: argparse.Namespace) -> Dict[str, Any]:
+    from src.services.watchlist_service import WatchlistService
+
+    service = WatchlistService()
+    if args.watchlist_command == "list":
+        return service.list()
+    if args.watchlist_command == "history":
+        return service.history(limit=args.limit)
+    if args.watchlist_command == "apply":
+        try:
+            payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise AgentCliError("validation_error", f"无法读取关注复查 JSON: {exc}") from exc
+        return service.apply_review(payload, max_auto_items=args.max_auto_items, cooldown_days=args.cooldown_days)
+    return service.change(args.symbol, action=args.watchlist_command, reason=args.reason)
 
 
 def _cmd_gold(args: argparse.Namespace) -> Dict[str, Any]:
@@ -443,7 +473,36 @@ def build_parser() -> argparse.ArgumentParser:
     context.set_defaults(handler=_cmd_context, command_name="context")
 
     review = commands.add_parser("market-review", help="大盘复盘（不推送通知）")
+    review.add_argument("--data-only", action="store_true", help="仅返回结构化行情，不调用模型；新闻使用 news")
+    review.add_argument("--region", choices=("cn", "hk", "us", "jp", "kr"), default="cn",
+                        help="--data-only 的市场，默认 cn")
     review.set_defaults(handler=_cmd_market_review, command_name="market-review")
+
+    news = commands.add_parser("news", help="读取已有情报源的新闻，不调用模型")
+    news.add_argument("--refresh", action="store_true", help="先抓取已启用的情报源，不创建或启用新源")
+    news.add_argument("--market", choices=("cn", "hk", "us", "jp", "kr", "tw", "global"))
+    news.add_argument("--days", type=int, default=3, help="最近 N 天抓取的新闻，仍需核对 published_at")
+    news.add_argument("--page", type=int, default=1)
+    news.add_argument("--page-size", type=int, default=50)
+    news.set_defaults(handler=_cmd_news, command_name="news")
+
+    watchlist = commands.add_parser("watchlist", help="关注列表与候选复查（不会记录交易）")
+    watchlist_cmds = watchlist.add_subparsers(dest="watchlist_command", required=True)
+    watchlist_list = watchlist_cmds.add_parser("list", help="读取关注、人工移除记录和版本")
+    watchlist_list.set_defaults(handler=_cmd_watchlist, command_name="watchlist list")
+    for action in ("add", "remove"):
+        change = watchlist_cmds.add_parser(action, help="执行用户明确要求的关注变更")
+        change.add_argument("symbol", help="股票代码或 AU9999 / Au99.99")
+        change.add_argument("--reason", default="用户指令")
+        change.set_defaults(handler=_cmd_watchlist, command_name=f"watchlist {action}")
+    apply = watchlist_cmds.add_parser("apply", help="提交候选复查与自动关注变更")
+    apply.add_argument("--file", required=True, help="包含 run_id、version、decisions 的 JSON 文件")
+    apply.add_argument("--max-auto-items", type=int, default=20)
+    apply.add_argument("--cooldown-days", type=int, default=3, help="自动移除后重新添加的冷却天数")
+    apply.set_defaults(handler=_cmd_watchlist, command_name="watchlist apply")
+    history = watchlist_cmds.add_parser("history", help="读取候选结论和关注变更记录")
+    history.add_argument("--limit", type=int, default=20)
+    history.set_defaults(handler=_cmd_watchlist, command_name="watchlist history")
 
     gold = commands.add_parser("gold", help="上海黄金交易所 Au99.99 实时价与日线（元/克），不做分析")
     gold.add_argument(
@@ -543,9 +602,15 @@ def _setup_runtime(debug: bool) -> None:
 
 def _classify_exception(exc: Exception) -> AgentCliError:
     from src.services.portfolio_service import PortfolioBusyError, PortfolioOversellError
+    from src.services.system_config_service import ConfigConflictError, ConfigValidationError
+    from src.services.watchlist_service import WatchlistConflictError
 
     if isinstance(exc, AgentCliError):
         return exc
+    if isinstance(exc, (WatchlistConflictError, ConfigConflictError)):
+        return AgentCliError("watchlist_conflict" if isinstance(exc, WatchlistConflictError) else "config_conflict", str(exc))
+    if isinstance(exc, ConfigValidationError):
+        return AgentCliError("validation_error", str(exc), details={"issues": exc.issues})
     if isinstance(exc, PortfolioOversellError):
         return AgentCliError("portfolio_oversell", str(exc))
     if isinstance(exc, PortfolioBusyError):
